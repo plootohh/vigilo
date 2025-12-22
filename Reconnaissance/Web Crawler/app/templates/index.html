@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vigilo | Unrestricted Search</title>
+    <style>
+        /* Theme */
+        :root {
+            --bg-void: #000000;
+            --bg-highlight: #111111;
+            --border-color: #333333;
+            
+            --text-main: #e0e0e0;
+            --text-muted: #888888;
+            --text-accent: #00eda0;
+            
+            --link-color: #8ab4f8;    
+            --link-visited: #c58af9;
+
+            --results-width: 650px;
+            --gap: 3rem;
+
+            /* The Gutter: This is the total area on the left of the search bar. */
+            /* The Logo will sit exactly in the middle of this value. */
+            --left-gutter: 180px; 
+        }
+
+        /* Reset */
+        * { box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-void);
+            color: var(--text-main);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        a { text-decoration: none; color: inherit; }
+
+        /* Header */
+        .app-header {
+            padding: 25px 0; 
+            position: sticky;
+            top: 0;
+            background-color: var(--bg-void); 
+            z-index: 100;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .header-row {
+            display: flex;
+            align-items: center;
+            position: relative;
+            padding-left: var(--left-gutter); /* Search bar starts exactly here */
+        }
+
+        /* Logo - Mathematically centered in the left-gutter */
+        .logo-container {
+            position: absolute;
+            left: 0;
+            width: var(--left-gutter);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .logo {
+            font-family: "Didot", "Bodoni MT", "Times New Roman", serif;
+            font-size: 2.5rem;
+            font-weight: 800; 
+            color: var(--text-main);
+            letter-spacing: -2px; 
+            text-decoration: none;
+            text-shadow: 0 0 2px rgba(255,255,255,0.3);
+            line-height: 1;
+        }
+        
+        .logo span { 
+            color: var(--text-accent);
+            font-size: 1.2em; 
+            line-height: 0;
+            vertical-align: middle;
+            margin-left: -2px;
+            text-shadow: 0 0 15px rgba(0, 237, 160, 0.6);
+            display: inline-block; 
+        }
+
+        .home-accent span { animation: neon-pulse 3s ease-in-out infinite; }
+        @keyframes neon-pulse {
+            0%, 100% { text-shadow: 0 0 15px rgba(0, 237, 160, 0.6); opacity: 0.8; }
+            50% { text-shadow: 0 0 30px rgba(0, 237, 160, 1), 0 0 50px rgba(0, 237, 160, 0.8); opacity: 1; }
+        }
+
+        /* Search inputs */
+        .search-wrapper {
+            position: relative;
+            flex-grow: 1;
+            max-width: 650px;
+        }
+
+        .search-input {
+            width: 100%;
+            background-color: var(--bg-highlight);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 14px 24px; 
+            border-radius: 24px; 
+            font-size: 1rem;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+
+        .search-input.open {
+            border-radius: 24px 24px 0 0;
+            border-bottom: 1px solid transparent;
+        }
+
+        .search-input:focus {
+            background-color: #222;
+            border-color: #444;
+            box-shadow: 0 1px 6px rgba(0,0,0,0.5);
+        }
+
+        /* Autocomplete */
+        .autocomplete-items {
+            position: absolute;
+            border: 1px solid #444;
+            border-top: none;
+            z-index: 99;
+            top: 100%;
+            left: 0;
+            right: 0;
+            border-radius: 0 0 24px 24px;
+            background-color: #222;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            display: none; 
+        }
+
+        .autocomplete-items div {
+            padding: 10px 20px;
+            cursor: pointer;
+            background-color: #222;
+            color: #ddd;
+            font-size: 0.95rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .autocomplete-items div:hover {
+            background-color: #333;
+            color: #fff;
+        }
+
+        /* Main Layout */
+        .main-container {
+            display: flex;
+            padding: 20px 0; 
+            flex: 1;
+            align-items: flex-start;
+        }
+
+        .results-column {
+            flex: 0 1 var(--results-width);
+            min-width: 0;
+            /* Result text starts exactly under the search bar */
+            margin-left: var(--left-gutter); 
+        }
+
+        .sidebar-column {
+            flex: 0 0 300px;
+            margin-left: var(--gap);
+        }
+
+        /* Result items */
+        .result-item {
+            margin-bottom: 25px;
+            padding: 18px;
+            border-radius: 12px;
+            border-left: 4px solid transparent; 
+            transition: all 0.2s ease;
+            /* The -22px allows the green highlight line to overlap the gutter 
+               while keeping the result text perfectly aligned with the search input */
+            margin-left: -22px; 
+            overflow: hidden; 
+        }
+
+        .result-item:hover {
+            background-color: var(--bg-highlight);
+            border-left-color: var(--text-accent);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+
+        .result-meta {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+
+        .result-url {
+            font-size: 0.85rem;
+            color: var(--text-main);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .result-title {
+            display: block;
+            font-size: 1.3rem;
+            color: var(--link-color);
+            margin-bottom: 5px;
+            font-weight: 400;
+        }
+        
+        .result-title:hover {
+            text-decoration: underline;
+        }
+
+        .result-snippet {
+            color: var(--text-muted);
+            font-size: 0.92rem;
+            line-height: 1.5;
+        }
+        
+        .result-snippet b, .result-title b { color: #fff; font-weight: 700; }
+
+        /* Sidebar Widgets */
+        .stat-box {
+            border-left: 2px solid var(--border-color);
+            padding-left: 20px;
+        }
+
+        .stat-line {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 15px;
+            font-family: monospace;
+        }
+
+        .mission-text {
+            font-size: 0.8rem;
+            color: #666;
+            margin-top: 30px;
+            line-height: 1.5;
+        }
+
+        /* Pagination */
+        .pagination {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-top: 40px;
+            padding-bottom: 50px;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .page-btn {
+            padding: 8px 16px;
+            background-color: var(--bg-highlight);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            transition: 0.2s;
+        }
+
+        .page-btn:hover {
+            border-color: var(--text-accent);
+            color: var(--text-accent);
+        }
+
+        @media (max-width: 1100px) {
+            .sidebar-column { display: none; }
+            .header-row { padding-left: 20px; }
+            .logo-container { position: static; width: auto; margin-right: 20px; }
+            .results-column { margin-left: 20px; max-width: calc(100% - 40px); flex: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    {% if not query %}
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 80vh; padding: 20px;">
+        <div class="logo home-accent" style="font-size: 5.5rem; margin-bottom: 40px;">Vigilo<span>.</span></div>
+        <form action="/search" method="get" style="width: 100%; max-width: 600px;" autocomplete="off">
+            <div class="search-wrapper" style="max-width: 100%;">
+                <input type="text" id="home-input" name="q" class="search-input" placeholder="Search freely..." autofocus>
+                <div id="home-input-list" class="autocomplete-items"></div>
+            </div>
+        </form>
+    </div>
+
+    {% else %}
+    <header class="app-header">
+        <div class="header-row">
+            <div class="logo-container">
+                <a href="/" class="logo">Vigilo<span>.</span></a>
+            </div>
+            <form action="/search" method="get" class="search-wrapper" autocomplete="off">
+                <input type="text" id="header-input" name="q" class="search-input" value="{{ query }}">
+                <div id="header-input-list" class="autocomplete-items"></div>
+            </form>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <div class="results-column">
+            {% if count == '0' %}
+                <div class="result-item" style="pointer-events: none;">
+                    <p style="color: var(--text-muted)">No results found for <b>{{ query }}</b>.</p>
+                </div>
+            {% else %}
+                {% for result in results %}
+                <div class="result-item">
+                    <div class="result-meta">
+                        <img src="https://www.google.com/s2/favicons?domain={{ result.domain }}&sz=32" 
+                             style="width: 16px; height: 16px; border-radius: 2px; vertical-align: middle;"
+                             onerror="this.style.display='none'">
+                        <span class="result-url">{{ result.url }}</span>
+                    </div>
+                    
+                    <a href="{{ result.url }}" class="result-title">{{ result.title }}</a>
+                    <div class="result-snippet">{{ result.snippet }}</div>
+                </div>
+                {% endfor %}
+
+                {% if total_pages > 1 %}
+                <div class="pagination">
+                    {% if page > 1 %}
+                        <a href="{{ url_for('search', q=query, page=page-1) }}" class="page-btn">&laquo; Previous</a>
+                    {% endif %}
+                    <span style="color: var(--text-muted);">{{ page }} / {{ total_pages }}</span>
+                    {% if page < total_pages %}
+                        <a href="{{ url_for('search', q=query, page=page+1) }}" class="page-btn">Next &raquo;</a>
+                    {% endif %}
+                </div>
+                {% endif %}
+            {% endif %}
+        </div>
+
+        <aside class="sidebar-column">
+            <div class="stat-box">
+                <div class="stat-line">Found <strong>{{ count }}</strong> results</div>
+                <div class="stat-line">Time: <strong>{{ time }}s</strong></div>
+                
+                <div class="mission-text">
+                    Vigilo is an unrestricted search engine dedicated to the free exchange of information. Results are served without curation or censorship.
+                </div>
+            </div>
+        </aside>
+    </div>
+    {% endif %}
+
+    <script>
+        function setupAutocomplete(inputId, listId) {
+            const input = document.getElementById(inputId);
+            const list = document.getElementById(listId);
+            if (!input) return;
+
+            input.addEventListener("input", function(e) {
+                const val = this.value;
+                if (!val || val.length < 2) {
+                    list.innerHTML = "";
+                    list.style.display = "none";
+                    input.classList.remove("open");
+                    return;
+                }
+                fetch(`/suggest?q=${encodeURIComponent(val)}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        list.innerHTML = "";
+                        if (data.length === 0) {
+                            list.style.display = "none";
+                            input.classList.remove("open");
+                            return;
+                        }
+                        data.forEach(item => {
+                            const div = document.createElement("div");
+                            const regex = new RegExp(`^(${val})`, "i");
+                            div.innerHTML = item.replace(regex, "<strong>$1</strong>");
+                            div.addEventListener("click", function() {
+                                input.value = item;
+                                list.innerHTML = "";
+                                list.style.display = "none";
+                                input.classList.remove("open");
+                                input.form.submit();
+                            });
+                            list.appendChild(div);
+                        });
+                        list.style.display = "block";
+                        input.classList.add("open");
+                    });
+            });
+
+            document.addEventListener("click", function (e) {
+                if (e.target !== input && e.target !== list) {
+                    list.style.display = "none";
+                    input.classList.remove("open");
+                }
+            });
+        }
+        setupAutocomplete("home-input", "home-input-list");
+        setupAutocomplete("header-input", "header-input-list");
+    </script>
+</body>
+</html>

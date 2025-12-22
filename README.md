@@ -14,13 +14,14 @@ This library is my ongoing personal project to learn Python and understand cyber
 ## Project Roadmap
 Here is the list of tools I am working on (subject to change):
 
-### 1. Basic Reconnaissance
+### 1. Reconnaissance
 - [x] ICMP Scanner
 - [x] TCP Port Scanner
 - [x] Traceroute Wrapper
 - [ ] Banner Grabber
 - [ ] WHOIS Lookup
 - [ ] DNS Enumerator
+- [ ] Web Crawler (IN PROGRESS)
 
 ### 2. Protocol Testing
 - [ ] ARP Scanner / Poisoner
