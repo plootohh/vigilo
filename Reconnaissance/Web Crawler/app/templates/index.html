@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vigilo | Unrestricted Search</title>
+    <title>Vigilo | Unfiltered Search</title>
     <style>
         /* Theme */
         :root {
@@ -21,8 +21,6 @@
             --results-width: 650px;
             --gap: 3rem;
 
-            /* The Gutter: This is the total area on the left of the search bar. */
-            /* The Logo will sit exactly in the middle of this value. */
             --left-gutter: 180px; 
         }
 
@@ -57,10 +55,10 @@
             display: flex;
             align-items: center;
             position: relative;
-            padding-left: var(--left-gutter); /* Search bar starts exactly here */
+            padding-left: var(--left-gutter);
         }
 
-        /* Logo - Mathematically centered in the left-gutter */
+        /* Logo */
         .logo-container {
             position: absolute;
             left: 0;
@@ -110,6 +108,7 @@
             border: 1px solid var(--border-color);
             color: var(--text-main);
             padding: 14px 24px; 
+            padding-right: 50px;
             border-radius: 24px; 
             font-size: 1rem;
             outline: none;
@@ -125,6 +124,35 @@
             background-color: #222;
             border-color: #444;
             box-shadow: 0 1px 6px rgba(0,0,0,0.5);
+        }
+
+        /* Search Button */
+        .search-btn {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--text-muted);
+            padding: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: color 0.2s ease;
+            border-radius: 50%;
+        }
+
+        .search-btn:hover {
+            color: var(--text-accent);
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .search-btn svg {
+            width: 20px;
+            height: 20px;
+            stroke-width: 2.5;
         }
 
         /* Autocomplete */
@@ -170,7 +198,6 @@
         .results-column {
             flex: 0 1 var(--results-width);
             min-width: 0;
-            /* Result text starts exactly under the search bar */
             margin-left: var(--left-gutter); 
         }
 
@@ -186,8 +213,6 @@
             border-radius: 12px;
             border-left: 4px solid transparent; 
             transition: all 0.2s ease;
-            /* The -22px allows the green highlight line to overlap the gutter 
-               while keeping the result text perfectly aligned with the search input */
             margin-left: -22px; 
             overflow: hidden; 
         }
@@ -211,6 +236,18 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+        }
+        
+        /* Language Tag Style */
+        .lang-tag {
+            font-size: 0.7rem;
+            color: var(--text-accent);
+            border: 1px solid #333;
+            padding: 1px 5px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            flex-shrink: 0;
         }
 
         .result-title {
@@ -294,6 +331,9 @@
         <form action="/search" method="get" style="width: 100%; max-width: 600px;" autocomplete="off">
             <div class="search-wrapper" style="max-width: 100%;">
                 <input type="text" id="home-input" name="q" class="search-input" placeholder="Search freely..." autofocus>
+                <button type="submit" class="search-btn" aria-label="Search">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
                 <div id="home-input-list" class="autocomplete-items"></div>
             </div>
         </form>
@@ -307,6 +347,9 @@
             </div>
             <form action="/search" method="get" class="search-wrapper" autocomplete="off">
                 <input type="text" id="header-input" name="q" class="search-input" value="{{ query }}">
+                <button type="submit" class="search-btn" aria-label="Search">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
                 <div id="header-input-list" class="autocomplete-items"></div>
             </form>
         </div>
@@ -322,10 +365,13 @@
                 {% for result in results %}
                 <div class="result-item">
                     <div class="result-meta">
-                        <img src="https://www.google.com/s2/favicons?domain={{ result.domain }}&sz=32" 
-                             style="width: 16px; height: 16px; border-radius: 2px; vertical-align: middle;"
-                             onerror="this.style.display='none'">
+                        <img src="https://www.google.com/s2/favicons?domain={{ result.domain }}&sz=32" style="width: 16px; height: 16px; border-radius: 2px; vertical-align: middle;"onerror="this.style.display='none'">
+                        
                         <span class="result-url">{{ result.url }}</span>
+
+                        {% if result.lang and result.lang != 'unknown' %}
+                        <span class="lang-tag">{{ result.lang }}</span>
+                        {% endif %}
                     </div>
                     
                     <a href="{{ result.url }}" class="result-title">{{ result.title }}</a>
@@ -353,7 +399,7 @@
                 <div class="stat-line">Time: <strong>{{ time }}s</strong></div>
                 
                 <div class="mission-text">
-                    Vigilo is an unrestricted search engine dedicated to the free exchange of information. Results are served without curation or censorship.
+                    Vigilo is an independent search engine dedicated to the free exchange of information. Results are delivered without curation, profiling, or censorship.
                 </div>
             </div>
         </aside>
