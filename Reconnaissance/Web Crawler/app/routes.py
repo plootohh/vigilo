@@ -2,15 +2,97 @@ from flask import render_template, request, jsonify
 from markupsafe import Markup
 from app import app
 from urllib.parse import urlparse
-import sqlite3, time, config, re, os
+import sqlite3, time, config, re, os, math, tldextract
 from datetime import datetime, timedelta
-from typing import List, Any
+
+
+extract = tldextract.TLDExtract(cache_dir=None)
+
+
+STOPWORDS = {"the", "a", "an", "of", "to", "and", "in", "on", "for", "with", "at", "by", "from"}
 
 
 def get_db_connection():
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def simple_stem(word):
+    if word.endswith("ing"): return word[:-3]
+    if word.endswith("ed"): return word[:-2]
+    if word.endswith("s") and len(word) > 3: return word[:-1]
+    return word
+
+
+def process_query(raw_query):
+    raw_query = raw_query.lower()
+    clean_raw = re.sub(r'[^a-z0-9\s]', '', raw_query)
+    tokens = clean_raw.split()
+    
+    clean_terms = []
+    processed_parts = []
+    
+    for t in tokens:
+        if t in STOPWORDS and len(tokens) > 1:
+            continue
+            
+        clean_terms.append(t)
+        stem = simple_stem(t)
+        
+        if stem != t:
+            processed_parts.append(f'("{t}" OR "{stem}"*)')
+        else:
+            processed_parts.append(f'"{t}"*')
+            
+    if len(clean_terms) > 1 and len(clean_terms) <= 4:
+        phrase = " ".join(clean_terms)
+        processed_parts.append(f'"{phrase}"')
+
+    fts_query = " AND ".join(processed_parts)
+    return fts_query, clean_terms
+
+
+def calculate_smart_score(row, query_terms, nav_slug):
+    score = 0.0
+    
+    url = row['url']
+    try: domain_only = extract(url).domain.lower()
+    except: domain_only = ""
+        
+    title = (row['title'] or "").lower()
+    
+    raw_rank = row['domain_rank'] if row['domain_rank'] else 10000000
+    rank = min(raw_rank, 5000000)
+    
+    fts_score = row['text_score'] if row['text_score'] is not None else 0.0
+    score += (fts_score * -3.5) 
+
+    try:
+        auth_points = (7.5 - math.log10(max(1, rank))) * 6.0
+        score += max(0, auth_points)
+    except: pass
+
+    if len(query_terms) > 1:
+        full_phrase = " ".join(query_terms)
+        if full_phrase in title:
+            score += 40.0
+    
+    if nav_slug and len(query_terms) <= 2:
+        if nav_slug == domain_only:
+            score += 500.0
+            path = urlparse(url).path
+            if path in ['', '/']:
+                score += 150.0
+
+    term_matches = sum(1 for t in query_terms if t in title)
+    score += (term_matches * 8.0)
+
+    slashes = url.count('/')
+    if slashes <= 3: score += 10.0
+    elif slashes > 5: score -= 5.0
+
+    return score
 
 
 @app.route("/")
@@ -22,212 +104,129 @@ def home():
 def dashboard():
     conn = get_db_connection()
     c = conn.cursor()
-    
-    # 1. Basic Counts
     c.execute("SELECT COUNT(*) FROM visited")
-    res_visited = c.fetchone()
-    total_visited = res_visited[0] if res_visited else 0
-    
+    total_visited = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM frontier")
-    res_frontier = c.fetchone()
-    total_frontier = res_frontier[0] if res_frontier else 0
-    
+    total_frontier = c.fetchone()[0]
     c.execute("SELECT crawled_at FROM visited ORDER BY crawled_at DESC LIMIT 1")
-    last_crawl = c.fetchone()
+    last = c.fetchone()
     status = "IDLE"
-    if last_crawl:
+    if last:
         try:
-            last_time = datetime.strptime(last_crawl[0], '%Y-%m-%d %H:%M:%S')
-            if datetime.now() - last_time < timedelta(seconds=60):
+            if datetime.now() - datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S") < timedelta(seconds=60):
                 status = "ACTIVE"
         except: pass
-            
-    five_mins_ago = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("SELECT COUNT(*) FROM visited WHERE crawled_at > ?", (five_mins_ago,))
-    res_ppm = c.fetchone()
-    pages_last_5m = res_ppm[0] if res_ppm else 0
-    ppm = round(pages_last_5m / 5, 1)
-    
+    five_min = (datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("SELECT COUNT(*) FROM visited WHERE crawled_at > ?", (five_min,))
+    ppm = round(c.fetchone()[0] / 5, 1)
     c.execute("SELECT COUNT(*) FROM frontier WHERE priority <= 20")
-    high_prio = c.fetchone()[0]
+    high = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM frontier WHERE priority > 20")
-    low_prio = c.fetchone()[0]
-    
+    low = c.fetchone()[0]
     c.execute("SELECT title, url, language, crawled_at FROM visited ORDER BY crawled_at DESC LIMIT 15")
-    recent_raw = c.fetchall()
-    recent_crawls = []
-    for row in recent_raw:
-        item = dict(row)
-        if not item['title']: item['title'] = "No Title Data"
-        recent_crawls.append(item)
-        
+    recent = [dict(r) for r in c.fetchall()]
     conn.close()
-    
-    return render_template(
-        "monitor.html",
-        total_visited="{:,}".format(total_visited),
-        total_frontier="{:,}".format(total_frontier),
-        recent_crawls=recent_crawls,
-        high_prio="{:,}".format(high_prio),
-        low_prio="{:,}".format(low_prio),
-        ppm=ppm,
-        status=status,
-        db_name=os.path.basename(config.DB_PATH)
-    )
+    return render_template("monitor.html", total_visited="{:,}".format(total_visited), total_frontier="{:,}".format(total_frontier), recent_crawls=recent, high_prio="{:,}".format(high), low_prio="{:,}".format(low), ppm=ppm, status=status, db_name=os.path.basename(config.DB_PATH))
 
 
 @app.route('/search')
 def search():
-    raw_query = request.args.get('q', '')
+    raw_query = request.args.get('q', '').strip()
     page = request.args.get('page', 1, type=int)
     per_page = 20
     
     if not raw_query: return render_template('index.html')
     
     start_time = time.time()
+    
+    fts_query, clean_terms = process_query(raw_query)
+    nav_slug = "".join(clean_terms) if len(clean_terms) <= 2 else None
+    
+    if not fts_query: return render_template('index.html')
+
     conn = get_db_connection()
     c = conn.cursor()
     
-    search_terms = []
-    site_filter = None
-    clean_query_terms = [] 
-    
-    tokens = raw_query.split()
-    for token in tokens:
-        if token.lower().startswith("site:"):
-            domain_part = token[5:]
-            if domain_part:
-                site_filter = domain_part
-        else:
-            clean_word = re.sub(r'[^a-zA-Z0-9]', '', token)
-            if clean_word:
-                search_terms.append(f'"{clean_word}"*')
-                clean_query_terms.append(clean_word)
-    
-    fts_query = " AND ".join(search_terms)
-    
-    highlight_regex_pattern = "|".join([re.escape(t) for t in clean_query_terms])
-    
-    if not fts_query: 
-        conn.close()
-        return render_template('index.html')
-        
-    buffer_limit = per_page * 3 
-    offset = (page - 1) * per_page
-    
     try:
-        count_sql = "SELECT COUNT(*) FROM search_index WHERE search_index MATCH ?"
-        count_params: List[Any] = [fts_query]
-        
-        if site_filter:
-            count_sql += " AND url LIKE ?"
-            count_params.append(f"%{site_filter}%")
-        
-        count_sql += " AND title NOT IN ('No Title', 'None')"
-            
-        c.execute(count_sql, tuple(count_params))
-        res_count = c.fetchone()
-        total_results = res_count[0] if res_count else 0
-        
-        sql_base = """
+        sql = """
             SELECT 
                 search_index.url, 
                 search_index.title, 
                 search_index.description, 
-                snippet(search_index, 3, 'START_BOLD', 'END_BOLD', '...', 64) as content_snippet,
-                visited.language
+                visited.language, 
+                IFNULL(visited.domain_rank, 10000000) as domain_rank,
+                bm25(search_index) as text_score,
+                snippet(search_index, 3, 'START_BOLD', 'END_BOLD', '...', 64) as content_snippet
             FROM search_index 
             JOIN visited ON search_index.url = visited.url
             WHERE search_index MATCH ? 
+            LIMIT 1000
         """
-        params: List[Any] = [fts_query]
         
-        if site_filter:
-            sql_base += " AND search_index.url LIKE ? "
-            params.append(f"%{site_filter}%")
-            
-        sql_base += " AND search_index.title NOT IN ('No Title', 'None')"
-        
-        nav_boost_sql = ""
-        if len(clean_query_terms) == 1:
-            term = clean_query_terms[0].lower()
-            
-            nav_boost_sql = """
-                CASE 
-                    -- TIER 0: Major TLDs
-                    WHEN visited.url LIKE '%://' || ? || '.com%' THEN 0
-                    WHEN visited.url LIKE '%://www.' || ? || '.com%' THEN 0
-                    WHEN visited.url LIKE '%://' || ? || '.net%' THEN 0
-                    WHEN visited.url LIKE '%://www.' || ? || '.net%' THEN 0
-                    WHEN visited.url LIKE '%://' || ? || '.org%' THEN 0
-                    WHEN visited.url LIKE '%://www.' || ? || '.org%' THEN 0
-                    WHEN visited.url LIKE '%://' || ? || '.gov%' THEN 0
-                    WHEN visited.url LIKE '%://' || ? || '.edu%' THEN 0
-                    
-                    -- TIER 1: Other TLDs (Catch-all for keyword domain match)
-                    WHEN visited.url LIKE '%://' || ? || '.%' THEN 1
-                    WHEN visited.url LIKE '%://www.' || ? || '.%' THEN 1
-                    
-                    ELSE 2
-                END ASC,
-            """
-            for _ in range(8): params.append(term)
-            for _ in range(2): params.append(term)
-        
-        sql_base += f" ORDER BY {nav_boost_sql} LENGTH(visited.url) ASC, bm25(search_index, 30.0, 5.0, 2.0, 1.0) ASC LIMIT ? OFFSET ?"
-        
-        params.extend([buffer_limit, offset])
-        
-        c.execute(sql_base, tuple(params))
+        c.execute(sql, (fts_query,))
         rows = c.fetchall()
+        
+        scored_results = []
+        seen_urls = set()
+        
+        for row in rows:
+            raw_url = row['url']
+            norm_url = re.sub(r'^https?://(www\.)?', '', raw_url).rstrip('/')
+            if norm_url in seen_urls: continue
+            seen_urls.add(norm_url)
+            
+            score = calculate_smart_score(row, clean_terms, nav_slug)
+            
+            scored_results.append({'row': row, 'score': score})
+            
+        scored_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        total_results = len(scored_results)
+        start_idx = (page - 1) * per_page
+        end_idx = start_idx + per_page
+        page_items = scored_results[start_idx:end_idx]
         
     except Exception as e:
         print(f"Search Error: {e}")
-        rows, total_results = [], 0
+        page_items, total_results = [], 0
     
     conn.close()
-    
+
     results = []
-    seen_normalized_urls = set()
     
-    for row in rows:
-        if len(results) >= per_page:
-            break
+    highlight_pattern = "|".join([re.escape(t) for t in clean_terms])
+    highlighter = None
+    if highlight_pattern:
+        highlighter = re.compile(f"({highlight_pattern})", re.IGNORECASE)
+
+    for item in page_items:
+        row = item['row']
+        title_text = row['title'] or "No Title"
+        
+        snippet = row['content_snippet']
+        desc = row['description']
+        if desc and len(str(desc)) > 15:
+            desc_lower = str(desc).lower()
+            if any(t in desc_lower for t in clean_terms):
+                snippet = desc
+        
+        if highlighter:
+            snippet = highlighter.sub(r"<b>\1</b>", str(snippet))
+            title_text = highlighter.sub(r"<b>\1</b>", str(title_text))
             
-        raw_url = row['url']
-        norm_url = re.sub(r'^https?://(www\.)?', '', raw_url).rstrip('/')
-        
-        if norm_url in seen_normalized_urls:
-            continue
-        
-        seen_normalized_urls.add(norm_url)
-        safe_content = row['content_snippet'].replace('<', '&lt;').replace('>', '&gt;')
-        highlighted_content = safe_content.replace('START_BOLD', '<b>').replace('END_BOLD', '</b>')
-        
-        final_snippet = ""
-        db_desc = row['description']
-        if db_desc and len(str(db_desc)) > 15:
-            safe_desc = str(db_desc).replace('<', '&lt;').replace('>', '&gt;')
-            if highlight_regex_pattern:
-                regex = re.compile(f"({highlight_regex_pattern})", re.IGNORECASE)
-                safe_desc = regex.sub(r'<b>\1</b>', safe_desc)
-            final_snippet = safe_desc
-        else:
-            final_snippet = highlighted_content
-            if not final_snippet or final_snippet.strip() == "...":
-                final_snippet = "No preview available."
-        title_text = row['title']
-        if highlight_regex_pattern:
-            regex = re.compile(f"({highlight_regex_pattern})", re.IGNORECASE)
-            title_text = regex.sub(r'<b>\1</b>', title_text)
+        rank = row['domain_rank']
+        is_verified = True if rank and rank <= 2000 else False
         
         results.append({
-            'title': Markup(title_text), 
-            'url': row['url'], 
-            'domain': urlparse(row['url']).netloc, 
-            'snippet': Markup(final_snippet),
-            'lang': row['language']
+            'title': Markup(title_text),
+            'url': row['url'],
+            'domain': urlparse(row['url']).netloc,
+            'snippet': Markup(snippet),
+            'lang': row['language'],
+            'verified': is_verified,
+            'rank': rank
         })
+        
     return render_template(
         'index.html', 
         query=raw_query, 
@@ -242,18 +241,17 @@ def search():
 @app.route('/suggest')
 def suggest():
     query = request.args.get('q', '')
-    if not query or len(query) < 2: return jsonify([])
+    if len(query) < 2: return jsonify([])
     
     conn = get_db_connection()
     c = conn.cursor()
-    
-    c.execute("SELECT title FROM visited WHERE title LIKE ? LIMIT 5", (f"{query}%",))
+    c.execute("SELECT title FROM visited WHERE title LIKE ? ORDER BY LENGTH(title) ASC LIMIT 5", (f"%{query}%",))
     
     suggestions = []
     seen = set()
     for row in c.fetchall():
         t = row['title']
-        if t and t not in seen and t != "No Title":
+        if t and t not in seen and t != "No Title" and len(t) < 60:
             suggestions.append(t)
             seen.add(t)
             

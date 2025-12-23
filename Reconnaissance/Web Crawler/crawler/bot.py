@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from crawler.utils import canonicalise
 
+# --- CONFIG ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,7 +32,7 @@ VISITED_BATCH_SIZE = 50
 thread_local = threading.local()
 
 SESSION = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retries = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
 SESSION.mount("http://", adapter)
 SESSION.mount("https://", adapter)
@@ -49,15 +50,28 @@ def calculate_priority(url):
     url_lower = url.lower()
     
     score += url.count('/') * 2
-    
     if parsed.query: score += 20
     
     trap_keywords = ['search', 'filter', 'login', 'signup', 'calendar', 'archive', 'tag']
     if any(k in url_lower for k in trap_keywords): score += 50
     
     if len(parsed.path) <= 1 and not parsed.query: score = 1
-    
     return score
+
+
+def get_domain_rank(domain):
+    try:
+        if domain.startswith("www."): search_domain = domain[4:]
+        else: search_domain = domain
+            
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT rank FROM domain_authority WHERE domain = ? LIMIT 1", (search_domain,))
+        row = c.fetchone()
+        if row: return row[0]
+        return 10000000
+    except:
+        return 10000000
 
 
 def crawl_url(current_url, retry_count):
@@ -76,9 +90,10 @@ def crawl_url(current_url, retry_count):
         html = download_page(current_url)
         
         if html == "NETWORK_ERROR":
-            if retry_count < 3:
+            if retry_count < 2:
                 requeue_url(current_url, retry_count + 1)
             return
+
         if html:
             data = extract_page_data(html, current_url)
             links = extract_links(html, current_url) 
@@ -89,14 +104,20 @@ def crawl_url(current_url, retry_count):
                     lang = detect(data['content'][:500])
             except LangDetectException: pass
             
+            rank = get_domain_rank(domain)
+            
             VISITED_BUFFER.put({
                 'url': current_url,
                 'title': data['title'],
                 'description': data['description'],
                 'keywords': data['keywords'],
                 'content': data['content'],
+                'h1': data['h1'],
+                'h2': data['h2'],
+                'important_text': data['important_text'],
                 'lang': lang,
-                'out_links': len(links)
+                'out_links': len(links),
+                'domain_rank': rank
             })
             
             if VISITED_BUFFER.qsize() >= VISITED_BATCH_SIZE:
@@ -106,7 +127,8 @@ def crawl_url(current_url, retry_count):
         else:
             VISITED_BUFFER.put({
                 'url': current_url, 'title': None, 'description': None, 
-                'keywords': None, 'content': None, 'lang': None, 'out_links': 0
+                'keywords': None, 'content': None, 'lang': None, 'out_links': 0,
+                'domain_rank': 10000000
             })
             
     except Exception as e:
@@ -116,7 +138,8 @@ def crawl_url(current_url, retry_count):
 def extract_page_data(html, url):
     soup = BeautifulSoup(html, "lxml")
     
-    for x in soup(["script", "style", "nav", "footer", "header", "noscript", "iframe"]): 
+    # Clean junk
+    for x in soup(["script", "style", "nav", "footer", "header", "noscript", "iframe", "svg"]): 
         x.extract()
         
     title = soup.title.string.strip() if soup.title and soup.title.string else "No Title"
@@ -125,19 +148,21 @@ def extract_page_data(html, url):
     description = ""
     if desc_tag:
         raw_desc = desc_tag.get('content', '')
-        if isinstance(raw_desc, list):
-            description = " ".join(raw_desc).strip()
-        else:
-            description = str(raw_desc).strip()
+        if isinstance(raw_desc, list): description = " ".join(raw_desc).strip()
+        else: description = str(raw_desc).strip()
     
     key_tag = soup.find('meta', attrs={'name': 'keywords'})
     keywords = ""
     if key_tag:
         raw_keys = key_tag.get('content', '')
-        if isinstance(raw_keys, list):
-            keywords = " ".join(raw_keys).strip()
-        else:
-            keywords = str(raw_keys).strip()
+        if isinstance(raw_keys, list): keywords = " ".join(raw_keys).strip()
+        else: keywords = str(raw_keys).strip()
+    
+    h1_text = " ".join([h.get_text(" ", strip=True) for h in soup.find_all("h1")])
+    
+    h2_text = " ".join([h.get_text(" ", strip=True) for h in soup.find_all(["h2", "h3"])])
+    
+    important_text = " ".join([t.get_text(" ", strip=True) for t in soup.find_all(["strong", "em", "b"])])
     
     text = soup.get_text(separator=" ", strip=True)
     
@@ -145,7 +170,10 @@ def extract_page_data(html, url):
         "title": title,
         "description": description,
         "keywords": keywords,
-        "content": text
+        "content": text,
+        "h1": h1_text,
+        "h2": h2_text,
+        "important_text": important_text
     }
 
 
@@ -172,7 +200,7 @@ def get_next_url():
                 SELECT url, retry_count FROM frontier 
                 WHERE priority < 100
                 ORDER BY priority ASC, added_at ASC 
-                LIMIT 1000
+                LIMIT 3000
             ) ORDER BY RANDOM() LIMIT 1
         """)
         
@@ -236,19 +264,30 @@ def flush_link_buffer():
 def flush_visited_buffer():
     if VISITED_BUFFER.empty(): return
     
-    batch_data = []
-    search_index_data = []
+    batch_visited = []
+    batch_index = []
     
     while not VISITED_BUFFER.empty():
         item = VISITED_BUFFER.get()
-        batch_data.append((
+        rank = item.get('domain_rank', 10000000)
+
+        batch_visited.append((
             item['url'], item['title'], item['description'], 
-            item['keywords'], item['content'], item['lang'], item['out_links']
+            item['keywords'], item['content'], item['lang'], 
+            item.get('out_links', 0), rank
         ))
-        if item['title']:
-            search_index_data.append((
-                item['url'], item['title'], item['description'], item['content']
+        
+        if item.get('title'):
+            batch_index.append((
+                item['url'], 
+                item['title'], 
+                item['description'], 
+                item['content'],
+                item.get('h1', ''), 
+                item.get('h2', ''), 
+                item.get('important_text', '')
             ))
+
     conn = get_db()
     try:
         c = conn.cursor()
@@ -256,19 +295,20 @@ def flush_visited_buffer():
         
         c.executemany("""
             INSERT OR REPLACE INTO visited 
-            (url, title, description, keywords, content, language, out_links) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, batch_data)
+            (url, title, description, keywords, content, language, out_links, domain_rank) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, batch_visited)
         
-        urls = [(x[0],) for x in batch_data]
+        urls = [(x[0],) for x in batch_visited]
         c.executemany("DELETE FROM search_index WHERE url=?", urls)
+        
         c.executemany("""
-            INSERT INTO search_index (url, title, description, content) 
-            VALUES (?, ?, ?, ?)
-        """, search_index_data)
+            INSERT INTO search_index (url, title, description, content, h1, h2, important_text) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, batch_index)
         
         conn.commit()
-        logging.info(f" [DB] Saved batch of {len(batch_data)} pages.")
+        logging.info(f" [DB] Saved batch of {len(batch_visited)} pages.")
     except Exception as e:
         logging.error(f"Visited Flush Error: {e}")
         try: conn.rollback()
