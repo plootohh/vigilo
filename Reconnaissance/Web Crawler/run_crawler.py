@@ -52,7 +52,7 @@ SEED_LIST = [
 
 
 def start_engine():
-    print(f"--- Launching Vigilo Engine (High Throughput / {MAX_WORKERS} Threads) ---")
+    print(f"--- Launching Vigilo Crawler ({MAX_WORKERS} Threads) ---")
     
     get_high_perf_connection(config.DB_PATH)
     

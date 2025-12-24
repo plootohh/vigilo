@@ -251,7 +251,6 @@ def check_permission(target_url, agent=config.USER_AGENT):
 
 def download_page(target_url):
     try:
-        
         response = SESSION.get(target_url, headers={'User-Agent': config.USER_AGENT}, timeout=5, stream=True)
         if response.status_code != 200: return None
         if "text/html" not in response.headers.get("Content-Type", "").lower(): return None
@@ -339,12 +338,21 @@ class DatabaseWriter(threading.Thread):
         
         while not VISITED_BUFFER.empty() and len(batch) < VISITED_BATCH_SIZE:
             item = VISITED_BUFFER.get()
+            
             batch.append((
-                item['url'], item['title'], item['description'], "", # Keywords placeholder
-                item['content'], item['lang'], item['out_links'], 
+                item['url'], 
+                item['title'], 
+                item['description'], 
+                "",
+                item['content'], 
+                item['h1'],
+                item['h2'],
+                item['lang'], 
+                item['out_links'], 
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
                 item['domain_rank']
             ))
+            
             urls_crawled.append((2, item['url']))
 
         if not batch: return
@@ -355,8 +363,8 @@ class DatabaseWriter(threading.Thread):
             
             c.executemany("""
                 INSERT OR REPLACE INTO visited 
-                (url, title, description, keywords, content, language, out_links, crawled_at, domain_rank) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (url, title, description, keywords, content, h1, h2, language, out_links, crawled_at, domain_rank) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, batch)
             
             c.executemany("UPDATE frontier SET status = ? WHERE url = ?", urls_crawled)

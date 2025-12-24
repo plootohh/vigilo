@@ -7,7 +7,7 @@ import config
 
 
 def init_database():
-    print("--- 1. Initialising Vigilo Database Schema (High-Performance) ---")
+    print("--- 1. Initialising Vigilo Database (Schema Fix) ---")
     
     db_dir = os.path.dirname(config.DB_PATH)
     if db_dir and not os.path.exists(db_dir):
@@ -30,7 +30,7 @@ def init_database():
         )
     """)
     
-    print("      Creating partial index for high-speed dispatch...")
+    print("      Creating partial index...")
     c.execute("DROP INDEX IF EXISTS idx_frontier_dispatch")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_frontier_pending 
@@ -46,6 +46,8 @@ def init_database():
             description TEXT,
             keywords TEXT,
             content TEXT,
+            h1 TEXT,
+            h2 TEXT,
             language TEXT,
             out_links INTEGER,
             crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -128,5 +130,4 @@ def download_and_import_ranks():
 
 if __name__ == "__main__":
     init_database()
-    download_and_import_ranks() 
-    print("\n[SUCCESS] Vigilo Database is ready for high-speed crawling.")
+    print("\n[SUCCESS] Vigilo Database is ready for crawling.")

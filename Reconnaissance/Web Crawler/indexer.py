@@ -37,7 +37,7 @@ def update_last_indexed_id(rowid):
 
 
 def run_indexer():
-    print("--- Vigilo Background Indexer (Watermark Method) ---")
+    print("--- Vigilo Indexer ---")
     
     last_id = get_last_indexed_id()
     print(f"Resuming indexing from ID: {last_id}")
