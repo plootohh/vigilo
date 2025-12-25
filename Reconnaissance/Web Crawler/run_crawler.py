@@ -8,11 +8,11 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from crawler.utils import get_high_perf_connection
-from crawler.bot import crawl_url, get_next_url, add_to_frontier_batch, start_writer
+from crawler.bot import crawl_url, get_next_url, add_to_frontier_batch, start_writer, release_url, recover_on_startup
 
 
-MAX_WORKERS = 50
-THREAD_TIMEOUT = 30
+MAX_WORKERS = 100
+THREAD_TIMEOUT = 20
 
 
 SEED_LIST = [
@@ -54,13 +54,13 @@ SEED_LIST = [
 def start_engine():
     print(f"--- Launching Vigilo Crawler ({MAX_WORKERS} Threads) ---")
     
-    get_high_perf_connection(config.DB_PATH)
+    recover_on_startup()
     
+    get_high_perf_connection(config.DB_PATH)
     writer = start_writer()
     
-    print(f" [i] Injecting seeds...")
     add_to_frontier_batch(SEED_LIST)
-    time.sleep(2)
+    time.sleep(1)
     
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
     active_crawls = {}
@@ -77,15 +77,22 @@ def start_engine():
                     break
             
             now = time.time()
-            for future, (url, start_time) in list(active_crawls.items()):
+            to_remove = []
+            
+            for future, (url, start_time) in active_crawls.items():
                 if now - start_time > THREAD_TIMEOUT:
                     if not future.done():
-                        active_crawls.pop(future)
-
+                        print(f" [!] Timeout ({int(now-start_time)}s): Resetting {url}")
+                        release_url(url) 
+                        to_remove.append(future)
+            
+            for f in to_remove:
+                active_crawls.pop(f)
+            
             if active_crawls:
                 done, _ = concurrent.futures.wait(
                     active_crawls.keys(), 
-                    timeout=0.2, 
+                    timeout=0.1, 
                     return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 for future in done:
@@ -98,19 +105,17 @@ def start_engine():
     except KeyboardInterrupt:
         print("\n [!] Interrupt received. Stopping engine...")
         
-        print(" [!] Killing worker threads...")
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
+        print(" [!] Resetting active URLs for next run...")
+        for _, (url, _) in active_crawls.items():
+            release_url(url)
 
         print(" [!] Saving remaining data...")
         writer.stop()
         writer.join()
         
-        print(" [!] Shutdown complete. All data saved.")
+        executor.shutdown(wait=False)
+        print(" [!] Shutdown complete.")
         sys.exit(0)
-
 
 if __name__ == "__main__":
     start_engine()

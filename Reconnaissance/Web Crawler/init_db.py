@@ -7,7 +7,7 @@ import config
 
 
 def init_database():
-    print("--- 1. Initialising Vigilo Database (Schema Fix) ---")
+    print("--- 1. Initialising Vigilo Database ---")
     
     db_dir = os.path.dirname(config.DB_PATH)
     if db_dir and not os.path.exists(db_dir):
@@ -26,16 +26,16 @@ def init_database():
             priority INTEGER DEFAULT 10,
             added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             status INTEGER DEFAULT 0,
-            retry_count INTEGER DEFAULT 0
+            retry_count INTEGER DEFAULT 0,
+            next_crawl_time DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    print("      Creating partial index...")
+    print("      Creating indexes...")
     c.execute("DROP INDEX IF EXISTS idx_frontier_dispatch")
     c.execute("""
-        CREATE INDEX IF NOT EXISTS idx_frontier_pending 
-        ON frontier(priority ASC, added_at ASC) 
-        WHERE status = 0
+        CREATE INDEX IF NOT EXISTS idx_frontier_schedule 
+        ON frontier(status, next_crawl_time, priority)
     """)
     
     print("[2/4] Creating table: visited")
@@ -46,8 +46,12 @@ def init_database():
             description TEXT,
             keywords TEXT,
             content TEXT,
+            raw_html BLOB,
+            http_headers TEXT,
+            http_status INTEGER,
             h1 TEXT,
             h2 TEXT,
+            important_text TEXT,
             language TEXT,
             out_links INTEGER,
             crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -116,18 +120,16 @@ def download_and_import_ranks():
         c.execute("PRAGMA synchronous=OFF") 
         c.execute("PRAGMA journal_mode=MEMORY") 
         c.execute("BEGIN IMMEDIATE")
-        
         c.executemany("INSERT OR IGNORE INTO domain_authority (domain, rank) VALUES (?, ?)", domain_ranks)
         
         conn.commit()
         conn.close()
-        
         print("--- Authority Import Complete ---")
-        
     except Exception as e:
         print(f"Error importing ranks: {e}")
 
 
 if __name__ == "__main__":
     init_database()
-    print("\n[SUCCESS] Vigilo Database is ready for crawling.")
+    download_and_import_ranks()
+    print("\n[SUCCESS] Vigilo Database is ready.")

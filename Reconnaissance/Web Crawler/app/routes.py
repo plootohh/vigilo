@@ -2,314 +2,449 @@ from flask import render_template, request, jsonify
 from markupsafe import Markup
 from app import app
 from urllib.parse import urlparse
-import sqlite3, time, config, re, os, math, tldextract
-from datetime import datetime, timedelta
-
+import sqlite3, time, config, re, math, tldextract
+from datetime import datetime
 
 extract = tldextract.TLDExtract(cache_dir=None)
 
 
+# -------------------------
+# Config
+# -------------------------
+PER_PAGE = 20
+CANDIDATE_POOL_SIZE = 400
+MAX_QUERY_TERMS = 7
+
+
 STOPWORDS = {
     "the","a","an","of","to","and","in","on","for","with","at","by","from",
-    "how","what","why","when","where"
+    "how","what","why","when","where","is","are","be","this","that","it","its"
 }
 
 
+SYNONYMS = {
+    "install": ["setup", "configure"],
+    "setup": ["install", "configure"],
+    "error": ["issue", "problem"],
+    "bug": ["issue", "defect"],
+    "security": ["infosec", "cybersecurity"],
+    "auth": ["authentication", "login"],
+    "login": ["authentication", "auth"],
+    "network": ["net", "networking"],
+    "linux": ["gnu", "unix"],
+    "windows": ["win"],
+}
+
+
+# -------------------------
+# DB helper
+# -------------------------
 def get_db_connection():
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def simple_stem(word):
-    if word.endswith("ing"): return word[:-3]
-    if word.endswith("ed"): return word[:-2]
-    if word.endswith("s") and len(word) > 3: return word[:-1]
-    return word
+# -------------------------
+# Query utilities
+# -------------------------
+def normalize_tokens(raw):
+    raw = raw.lower()
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    tokens = raw.split()
+    tokens = [t for t in tokens if t not in STOPWORDS and len(t) > 1]
+    tokens = list(dict.fromkeys(tokens))
+    return tokens[:MAX_QUERY_TERMS]
 
 
-def classify_intent(terms):
-    if not terms:
-        return "unknown"
-    if len(terms) <= 2:
-        return "navigational"
-    if any(t in {"how","what","why","guide","tutorial","install"} for t in terms):
-        return "informational"
-    if any(re.search(r"\d", t) for t in terms):
-        return "reference"
-    return "informational"
+def normalize_for_brand(raw):
+    return re.sub(r"[^a-z0-9]", "", raw.lower())
 
 
-def process_query(raw_query):
-    raw_query = raw_query.lower()
-    clean_raw = re.sub(r'[^a-z0-9\s]', '', raw_query)
-    tokens = clean_raw.split()
-
-    clean_terms = []
-    processed_parts = []
-
+def extract_site_directives(raw):
+    raw_low = raw.lower()
+    m = re.search(r"site:\s*([a-z0-9.\-]+)", raw_low)
+    if m:
+        return m.group(1)
+    tokens = re.findall(r"[a-z0-9.]+", raw_low)
     for t in tokens:
-        if t in STOPWORDS and len(tokens) > 1:
-            continue
-        clean_terms.append(t)
-        stem = simple_stem(t)
-        if stem != t:
-            processed_parts.append(f'("{t}" OR "{stem}"*)')
-        else:
-            processed_parts.append(f'"{t}"*')
-
-    if 1 < len(clean_terms) <= 4:
-        processed_parts.append(f'"{" ".join(clean_terms)}"')
-
-    return " AND ".join(processed_parts), clean_terms
+        if "." in t and len(t) > 4:
+            return t
+    return None
 
 
-def proximity_score(text, terms):
-    if not text:
+def expand_terms(base_terms):
+    expanded = list(base_terms)
+    for t in base_terms:
+        # Add synonyms
+        for s in SYNONYMS.get(t, []):
+            expanded.append(s)
+    return list(dict.fromkeys(expanded))
+
+
+def build_fts_query_for_terms(base_terms):
+    if not base_terms:
+        return ""
+    
+    groups = []
+    for t in base_terms:
+        variants = [f'"{t}"', f'"{t}"*']
+        
+        for s in SYNONYMS.get(t, []):
+            variants.append(f'"{s}"')
+            
+        groups.append("(" + " OR ".join(variants) + ")")
+    
+    return " AND ".join(groups)
+
+
+def term_weights(original_terms, expanded_terms):
+    weights = {}
+    original_set = set(original_terms)
+    for t in expanded_terms:
+        base = 1.0 + min(1.5, len(t) / 6.0)
+        if t not in original_set:
+            base *= 0.5
+        weights[t] = base
+    return weights
+
+
+# -------------------------
+# Text analysis & proximity
+# -------------------------
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower()) if text else []
+
+
+def multi_term_proximity(text, terms):
+    tokens = tokenize(text)
+    if len(tokens) < 2 or len(terms) < 2:
         return 0.0
-
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    positions = {t: [] for t in terms}
-
+    
+    positions = []
     for i, tok in enumerate(tokens):
-        if tok in positions:
-            positions[tok].append(i)
-
-    valid = [v for v in positions.values() if v]
-    if len(valid) < 2:
+        if any(t in tok for t in terms):
+            positions.append(i)
+            
+    if len(positions) < 2:
         return 0.0
+        
+    span = max(positions) - min(positions)
+    return max(0.0, 30.0 / (1.0 + span))
 
-    min_span = float("inf")
-    for a in valid:
-        for b in valid:
-            if a is b:
-                continue
-            for i in a:
-                for j in b:
-                    min_span = min(min_span, abs(i - j))
 
-    if min_span == float("inf"):
+def saturation(val, cap):
+    return min(val / cap, 1.0)
+
+
+# -------------------------
+# Scoring components
+# -------------------------
+def authority_score(rank):
+    if not rank:
         return 0.0
+    return 160.0 / (1.0 + math.log10(float(rank) + 10))
 
-    return max(0.0, 25.0 / (1.0 + min_span))
 
-
-def calculate_smart_score(row, query_terms, nav_slug, intent):
-    score = 0.0
-
-    url = row["url"]
-    title = (row["title"] or "").lower()
-    desc = (row["description"] or "").lower()
-    snippet = (row["content_snippet"] or "").lower()
-
+def freshness_score(crawled_at):
+    if not crawled_at:
+        return 0.0
     try:
-        domain_only = extract(url).domain.lower()
+        dt = datetime.strptime(crawled_at, "%Y-%m-%d %H:%M:%S")
+        age = (datetime.now() - dt).days
+        return 25.0 * math.exp(-age / 200.0)
     except:
-        domain_only = ""
+        return 0.0
 
-    fts = row["text_score"] or 0.0
-    score += fts * -3.2
 
-    rank = min(row["domain_rank"] or 10_000_000, 5_000_000)
+def tld_bias(url):
     try:
-        score += (1 / (1 + math.log10(rank))) * 60.0
+        tld = extract(url).suffix or ""
+        if tld in {"gov", "edu", "org"}:
+            return 15.0
+        if tld in {"io", "dev", "net"}:
+            return 8.0
     except:
         pass
+    return 0.0
 
-    full_phrase = " ".join(query_terms)
 
-    if full_phrase in title:
-        score += 45
-    elif full_phrase in desc:
-        score += 25
+def url_quality(url):
+    try:
+        p = urlparse(url)
+        score = 0.0
+        depth = p.path.count("/")
+        
+        score -= max(0, depth - 3) * 4.0
+        
+        if "?" in url:
+            score -= 12.0
+            
+        tokens = tokenize(p.path)
+        score += min(10.0, len(tokens) * 2.0)
+        
+        if p.path in ("", "/"):
+            score += 12.0
+        return score
+    except:
+        return 0.0
 
-    title_hits = sum(t in title for t in query_terms)
-    desc_hits = sum(t in desc for t in query_terms)
 
-    score += title_hits * 9
-    score += desc_hits * 4
+def field_score(row, terms, weights):
+    title = (row.get("title") or "").lower()
+    desc = (row.get("description") or "").lower()
+    url = row.get("url", "").lower()
+    
+    score = 0.0
+    phrase = " ".join(terms)
+    
+    if phrase and phrase in title:
+        score += 90.0
+    elif phrase and phrase in desc:
+        score += 50.0
+        
+    title_hits = sum(weights.get(t, 0.0) for t in terms if t in title)
+    desc_hits = sum(weights.get(t, 0.0) for t in terms if t in desc)
+    url_hits = sum(weights.get(t, 0.0) for t in terms if t in url)
+    
+    score += saturation(title_hits, 4.0) * 70.0
+    score += saturation(desc_hits, 6.0) * 35.0
+    score += saturation(url_hits, 4.0) * 30.0
+    
+    score += multi_term_proximity(title, terms) * 1.6
+    score += multi_term_proximity(desc, terms)
+    
+    return score
 
-    path = urlparse(url).path.lower()
-    path_hits = sum(t in path for t in query_terms)
-    score += path_hits * 6
+def intent_boost(intent, url, nav_slug):
+    if intent == "navigational" and nav_slug:
+        try:
+            if nav_slug in urlparse(url).netloc:
+                return 180.0
+        except:
+            pass
+    return 0.0
 
-    score += proximity_score(snippet, query_terms)
+def click_feedback(conn, url):
+    return 0.0
 
-    if intent == "navigational" and nav_slug == domain_only:
-        score += 420
-        if path in ("","/"):
-            score += 120
+def language_score(row_lang, user_lang):
+    if not row_lang:
+        return 0.0
+    try:
+        rl = row_lang.lower().split("-")[0]
+        ul = user_lang.lower().split("-")[0]
+        if rl == ul:
+            return 40.0
+        if rl and ul and rl[0] == ul[0]:
+            return 8.0
+        return -10.0
+    except:
+        return 0.0
 
-    slashes = path.count("/")
-    if slashes <= 2:
-        score += 12
-    elif slashes >= 6:
-        score -= 10
 
-    if "?" in url:
-        score -= 8
+# -------------------------
+# Domain/brand helpers
+# -------------------------
+def domain_from_url(url):
+    try:
+        e = extract(url)
+        return e.domain or ""
+    except:
+        return ""
 
-    total_hits = title_hits + desc_hits + path_hits
-    if total_hits == 0:
-        score -= 20
-    elif total_hits > len(query_terms) * 5:
-        score -= 15
+
+def matches_brand_phrase(raw_normalized_no_space, row_domain_base):
+    if not row_domain_base: return False
+    return raw_normalized_no_space == row_domain_base
+
+
+# -------------------------
+# Final score aggregation
+# -------------------------
+def calculate_score(conn, row, terms, weights, intent, nav_slug, domain_counts,
+                    site_directive=None, raw_brand_normalized="",
+                    user_lang="en"):
+    
+    score = 100.0
+    
+    score += authority_score(row.get("domain_rank"))
+    score += freshness_score(row.get("crawled_at"))
+    score += tld_bias(row.get("url"))
+    score += url_quality(row.get("url"))
+    
+    score += field_score(row, terms, weights)
+    score += intent_boost(intent, row.get("url"), nav_slug)
+    
+    domain = urlparse(row.get("url")).netloc
+    score -= domain_counts.get(domain, 0) * 15.0
 
     try:
-        if row["crawled_at"]:
-            crawled = datetime.strptime(row["crawled_at"], "%Y-%m-%d %H:%M:%S")
-            age_days = (datetime.now() - crawled).days
-            if age_days > 365:
-                score -= min(10, age_days / 365)
+        row_domain_base = domain_from_url(row.get("url"))
+        parsed = urlparse(row.get("url"))
+        is_root = parsed.path in ("", "/")
+        
+        if site_directive:
+            sd = site_directive.lower().rstrip("/")
+            if sd and (sd in domain or sd == row_domain_base):
+                if is_root:
+                    score += 240.0
+                else:
+                    score += 80.0
+                    
+        if raw_brand_normalized:
+            if matches_brand_phrase(raw_brand_normalized, row_domain_base):
+                if is_root:
+                    score += 220.0
+                else:
+                    score += 40.0
     except:
         pass
 
     return score
 
+
+# -------------------------
+# Routes
+# -------------------------
 @app.route("/")
 def home():
     return render_template("index.html")
 
 @app.route("/search")
 def search():
-    raw_query = request.args.get("q","").strip()
+    raw_query = request.args.get("q", "").strip()
     page = request.args.get("page", 1, type=int)
-    
-    PER_PAGE_DISPLAY = 20
-    POOL_SIZE = 200 
-    
+
     if not raw_query:
         return render_template("index.html")
 
-    start = time.time()
+    start_time = time.time()
 
-    fts_query, terms = process_query(raw_query)
-    intent = classify_intent(terms)
-    nav_slug = "".join(terms) if len(terms) <= 2 else None
+    accept = request.headers.get("Accept-Language", "en")
+    user_lang = accept.split(",")[0].split(";")[0].strip() or "en"
+
+    site_directive = extract_site_directives(raw_query)
+    base_terms = normalize_tokens(raw_query)
+    
+    if not base_terms:
+        base_terms = raw_query.lower().split()
+        
+    expanded_terms = expand_terms(base_terms)
+    weights = term_weights(base_terms, expanded_terms)
+    fts_query = build_fts_query_for_terms(base_terms)
+
+    intent = "navigational" if len(base_terms) <= 2 else "informational"
+    raw_brand_normalized = normalize_for_brand(raw_query)
 
     conn = get_db_connection()
     c = conn.cursor()
 
     results = []
-    total_count = 0
-
+    total_estimated = 0
+    
     try:
-        
-        sql_fetch = """
+        sql = """
             SELECT
-                s.url,
-                s.title,
-                s.description,
-                snippet(search_index, 3, 'START_BOLD', 'END_BOLD', '...', 64) AS content_snippet,
-                bm25(search_index) AS text_score,
-                v.language,
-                v.crawled_at,
-                IFNULL(v.domain_rank, 10000000) AS domain_rank
-            FROM search_index s
-            JOIN visited v ON s.url = v.url
-            WHERE s MATCH ?
-            ORDER BY (bm25(search_index) * -1) + (1000000.0 / (IFNULL(v.domain_rank, 1000000) + 1)) DESC
+                search_index.url,
+                search_index.title,
+                search_index.description,
+                snippet(search_index, 2, '<b>', '</b>', '...', 64) AS snippet,
+                visited.crawled_at,
+                visited.language,
+                visited.domain_rank
+            FROM search_index
+            JOIN visited ON search_index.url = visited.url
+            WHERE search_index MATCH ?
             LIMIT ?
         """
         
-        
-        c.execute(sql_fetch, (fts_query, POOL_SIZE))
-        candidates = c.fetchall()
+        c.execute(sql, (fts_query, CANDIDATE_POOL_SIZE))
+        rows = c.fetchall()
 
-        count_sql = """
-            SELECT count(*) 
-            FROM search_index_rowid 
-            WHERE rowid IN (
-                SELECT rowid FROM search_index WHERE search_index MATCH ?
-            )
-        """
-        try:
-            c.execute(count_sql, (fts_query,))
-            total_count = c.fetchone()[0]
-        except:
-            total_count = len(candidates)
-
+        seen_norm = set()
+        domain_counts = {}
         scored = []
-        seen = set()
 
-        for r in candidates:
-            norm = re.sub(r'^https?://(www\.)?', '', r["url"]).rstrip("/")
-            if norm in seen:
+        for r in rows:
+            row_dict = dict(r)
+            
+            norm = re.sub(r"^https?://(www\.)?", "", row_dict["url"].strip("/")).rstrip("/")
+            if norm in seen_norm:
                 continue
-            seen.add(norm)
+            seen_norm.add(norm)
 
-            s = calculate_smart_score(r, terms, nav_slug, intent)
-            scored.append((s, r))
+            domain = urlparse(row_dict["url"]).netloc
+            domain_counts.setdefault(domain, 0)
+
+            score = calculate_score(
+                conn, row_dict, expanded_terms, weights, intent, None, domain_counts,
+                site_directive=site_directive, raw_brand_normalized=raw_brand_normalized,
+                user_lang=user_lang
+            )
+            scored.append((score, row_dict))
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        
-        start_idx = (page - 1) * PER_PAGE_DISPLAY
-        end_idx = start_idx + PER_PAGE_DISPLAY
-        
-        page_rows = scored[start_idx:end_idx]
+        total_estimated = len(scored)
+        start_idx = (page - 1) * PER_PAGE
+        end_idx = start_idx + PER_PAGE
 
-        highlight = re.compile("("+"|".join(map(re.escape, terms))+")", re.I) if terms else None
-
-        for _, r in page_rows:
-            title = r["title"] or "No Title"
-            raw_snippet = r["content_snippet"] or ""
-            raw_snippet = raw_snippet.replace("START_BOLD", "").replace("END_BOLD", "")
+        for score, r in scored[start_idx:end_idx]:
+            clean_snip = r["snippet"] or ""
+            if not clean_snip and r.get("description"):
+                clean_snip = r["description"][:200] + "..."
             
-            if highlight:
-                title = highlight.sub(r"<b>\1</b>", title)
-                display_snippet = highlight.sub(r"<b>\1</b>", raw_snippet)
-            else:
-                display_snippet = raw_snippet
+            title = r["title"] or r["url"]
+            domain = urlparse(r["url"]).netloc
+            
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            
+            rank = r.get("domain_rank") or 10000000
 
             results.append({
                 "title": Markup(title),
                 "url": r["url"],
-                "domain": urlparse(r["url"]).netloc,
-                "snippet": Markup(display_snippet),
-                "lang": r["language"],
-                "verified": bool(r["domain_rank"] and r["domain_rank"] <= 5000),
-                "rank": r["domain_rank"]
+                "domain": domain,
+                "snippet": Markup(clean_snip),
+                "lang": r.get("language"),
+                "rank": rank,
+                "verified": (rank < 10000)
             })
 
     except Exception as e:
-        print(f"Search Error: {e}")
-        results = []
-        total_count = 0
+        print(f"Search error: {e}")
+    finally:
+        conn.close()
 
-    conn.close()
+    elapsed = round(time.time() - start_time, 4)
+    total_pages = (total_estimated // PER_PAGE) + (1 if total_estimated % PER_PAGE else 0)
 
     return render_template(
         "index.html",
         query=raw_query,
         results=results,
-        count="{:,}".format(total_count),
-        time=round(time.time()-start, 4),
+        count=total_estimated,
+        time=elapsed,
         page=page,
-        total_pages=(total_count + PER_PAGE_DISPLAY - 1) // PER_PAGE_DISPLAY
+        total_pages=total_pages
     )
 
 
 @app.route("/suggest")
 def suggest():
-    q = request.args.get("q","")
+    q = request.args.get("q", "").strip()
     if len(q) < 2:
         return jsonify([])
-
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT title FROM visited WHERE title LIKE ? LIMIT 5",
-        (f"%{q}%",)
-    )
-
-    seen=set()
-    out=[]
-    for r in c.fetchall():
-        t=r["title"]
-        if t and t not in seen and len(t)<60:
-            out.append(t)
-            seen.add(t)
-
-    conn.close()
-    return jsonify(out)
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT title FROM visited WHERE title LIKE ? LIMIT 5", (f"%{q}%",))
+        rows = c.fetchall()
+        return jsonify([r[0] for r in rows if r[0]])
+    except:
+        return jsonify([])
+    finally:
+        if conn:
+            conn.close()

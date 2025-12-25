@@ -3,7 +3,8 @@ import math
 import mmh3
 import pickle
 import os
-from urllib.parse import urlparse, urldefrag, parse_qsl
+import zlib
+from urllib.parse import urlparse
 
 
 class BloomFilter:
@@ -53,10 +54,22 @@ def get_high_perf_connection(db_path):
     conn = sqlite3.connect(db_path, timeout=60, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;") 
     conn.execute("PRAGMA synchronous=NORMAL;") 
-    conn.execute("PRAGMA cache_size=-64000;") # 64MB Cache
+    conn.execute("PRAGMA cache_size=-64000;") 
     conn.execute("PRAGMA temp_store=MEMORY;") 
     conn.execute("PRAGMA mmap_size=30000000000;") 
     return conn
+
+
+def compress_html(data):
+    if not data: return None
+    if isinstance(data, str): 
+        data = data.encode('utf-8')
+    return zlib.compress(data)
+
+
+def decompress_html(blob_data):
+    if not blob_data: return ""
+    return zlib.decompress(blob_data).decode('utf-8', errors='replace')
 
 
 def canonicalise(url):
@@ -78,7 +91,7 @@ def canonicalise(url):
         path = parsed.path.replace("//", "/")
         if not path: path = "/"
         
-        if any(ext in path.lower() for ext in ['.png','.jpg','.jpeg','.gif','.css','.js','.ico','.svg','.pdf','.zip']):
+        if any(ext in path.lower() for ext in ['.png','.jpg','.jpeg','.gif','.css','.js','.ico','.svg','.pdf','.zip','.exe','.mp4']):
             return None
 
         clean_url = f"{parsed.scheme}://{netloc}{path}"
