@@ -21,7 +21,7 @@ Here is the list of tools I am working on (subject to change):
 - [ ] Banner Grabber
 - [ ] WHOIS Lookup
 - [ ] DNS Enumerator
-- [ ] Web Crawler (IN PROGRESS)
+- [x] Web Crawler (IN PROGRESS)
 
 ### 2. Protocol Testing
 - [ ] ARP Scanner / Poisoner
