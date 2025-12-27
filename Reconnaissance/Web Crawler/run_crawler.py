@@ -1,121 +1,97 @@
-import concurrent.futures
-import time
-import logging
-import sys
-import os
+import threading, time, sys, os, sqlite3, logging
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from crawler.utils import get_high_perf_connection
-from crawler.bot import crawl_url, get_next_url, add_to_frontier_batch, start_writer, release_url, recover_on_startup
+from crawler.bot import (
+    fetch_worker, 
+    parse_worker, 
+    db_writer, 
+    dispatcher_loop, 
+    recover, 
+    FETCH_QUEUE, 
+    PARSE_QUEUE, 
+    WRITE_QUEUE
+)
 
+# --- CONFIGURATION ---
+FETCH_THREADS = config.FETCH_THREADS
+PARSE_THREADS = config.PARSE_THREADS
 
-MAX_WORKERS = 100
-THREAD_TIMEOUT = 20
-
-
-SEED_LIST = [
-    "https://www.abc.net.au",
-    "https://www.bbc.com",
-    "https://www.bloomberg.com",
-    "https://www.cnn.com",
-    "https://www.aljazeera.com",
-    "https://www.reuters.com",
-    "https://www.npr.org",
-    "https://github.com",
-    "https://www.stackoverflow.com/",
-    "https://slashdot.org",
-    "https://news.ycombinator.com",
-    "https://dev.to",
-    "https://www.w3schools.com",
-    "https://developer.mozilla.org",
-    "https://www.wikipedia.org",
-    "https://en.wikipedia.org/wiki/Main_Page",
-    "https://curlie.org",
-    "https://www.britannica.com",
-    "https://archive.org",
-    "https://www.mit.edu",
-    "https://www.stanford.edu",
-    "https://www.harvard.edu",
-    "https://www.youtube.com",
-    "https://www.reddit.com",
-    "https://medium.com",
-    "https://wordpress.com/discover",
-    "https://www.amazon.com",
-    "https://www.ebay.com",
-    "https://www.craigslist.org",
-    "https://www.popurls.com",
-    "https://alltop.com",
-    "https://drudgereport.com"
-]
-
-
-def start_engine():
-    print(f"--- Launching Vigilo Crawler ({MAX_WORKERS} Threads) ---")
-    
-    recover_on_startup()
-    
-    get_high_perf_connection(config.DB_PATH)
-    writer = start_writer()
-    
-    add_to_frontier_batch(SEED_LIST)
-    time.sleep(1)
-    
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    active_crawls = {}
-
+def monitor_loop():
+    start_time = time.time()
     try:
         while True:
-            while len(active_crawls) < MAX_WORKERS:
-                task = get_next_url() 
-                if task and task[0]:
-                    url, retry = task
-                    future = executor.submit(crawl_url, url, retry)
-                    active_crawls[future] = (url, time.time())
-                else:
-                    break
+            uptime = int(time.time() - start_time)
+            m, s = divmod(uptime, 60)
+            h, m = divmod(m, 60)
             
-            now = time.time()
-            to_remove = []
+            q_fetch = FETCH_QUEUE.qsize()
+            q_parse = PARSE_QUEUE.qsize()
+            q_write = WRITE_QUEUE.qsize()
             
-            for future, (url, start_time) in active_crawls.items():
-                if now - start_time > THREAD_TIMEOUT:
-                    if not future.done():
-                        print(f" [!] Timeout ({int(now-start_time)}s): Resetting {url}")
-                        release_url(url) 
-                        to_remove.append(future)
-            
-            for f in to_remove:
-                active_crawls.pop(f)
-            
-            if active_crawls:
-                done, _ = concurrent.futures.wait(
-                    active_crawls.keys(), 
-                    timeout=0.1, 
-                    return_when=concurrent.futures.FIRST_COMPLETED
-                )
-                for future in done:
-                    if future in active_crawls:
-                        active_crawls.pop(future)
-            else:
-                print(" [!] Frontier exhausted or DB locked. Retrying in 5s...")
-                time.sleep(5)
-                
+            sys.stdout.write(
+                f"\r[RUNTIME {h:02}:{m:02}:{s:02}] "
+                f"FetchQ: {q_fetch:<6} | "
+                f"ParseQ: {q_parse:<4} | "
+                f"WriteQ: {q_write:<4} | "
+                f"Active Threads: {threading.active_count()}"
+            )
+            sys.stdout.flush()
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n [!] Interrupt received. Stopping engine...")
-        
-        print(" [!] Resetting active URLs for next run...")
-        for _, (url, _) in active_crawls.items():
-            release_url(url)
+        pass
 
-        print(" [!] Saving remaining data...")
-        writer.stop()
-        writer.join()
+
+def main():
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    print(f"==========================================")
+    print(f"   VIGILO CRAWLER ENGINE                  ")
+    print(f"==========================================")
+    print(f" Database: {config.DB_CRAWL}")
+    print(f" Fetchers: {FETCH_THREADS}")
+    print(f" Parsers:  {PARSE_THREADS}")
+    print(f"==========================================\n")
+
+    print(" [INIT] Recovering database state...")
+    recover()
+    
+    threads = []
+    
+    print(" [START] Launching DB Writer...")
+    t_db = threading.Thread(target=db_writer, name="DB_Writer", daemon=True)
+    t_db.start()
+    threads.append(t_db)
+    
+    print(" [START] Launching Dispatcher...")
+    t_disp = threading.Thread(target=dispatcher_loop, name="Dispatcher", daemon=True)
+    t_disp.start()
+    threads.append(t_disp)
+    
+    print(f" [START] Spawning {FETCH_THREADS} Fetch Workers...")
+    for i in range(FETCH_THREADS):
+        t = threading.Thread(target=fetch_worker, name=f"Fetcher-{i}", daemon=True)
+        t.start()
+        threads.append(t)
         
-        executor.shutdown(wait=False)
-        print(" [!] Shutdown complete.")
+    print(f" [START] Spawning {PARSE_THREADS} Parse Workers...")
+    for i in range(PARSE_THREADS):
+        t = threading.Thread(target=parse_worker, name=f"Parser-{i}", daemon=True)
+        t.start()
+        threads.append(t)
+
+    print("\n [SYSTEM] Engine is running. Press Ctrl+C to stop.\n")
+
+    try:
+        monitor_loop()
+    except KeyboardInterrupt:
+        print("\n\n [STOP] Shutdown signal received!")
+        print(" [STOP] Waiting for queues to drain (5s)...")
+        time.sleep(2) 
+        print(" [STOP] Shutdown complete.")
         sys.exit(0)
 
+
 if __name__ == "__main__":
-    start_engine()
+    main()

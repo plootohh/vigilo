@@ -1,7 +1,4 @@
-import sqlite3
-import time
-import os
-import sys
+import sqlite3, time, os, sys
 from collections import deque
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -10,84 +7,77 @@ import config
 
 # --- CONFIGURATION ---
 REFRESH_RATE = 2
-AVG_WINDOW_SIZE = 10
+AVG_WINDOW_SIZE = 30
 
 
-def get_db():
-    try:
-        path = config.DB_PATH.replace("\\", "/") 
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
-    except:
-        conn = sqlite3.connect(config.DB_PATH, timeout=1)
+def get_sizes_mb():
+    db_mb = 0.0
+    wal_mb = 0.0
     
-    conn.row_factory = sqlite3.Row
-    return conn
+    paths = [config.DB_CRAWL, config.DB_STORAGE, config.DB_SEARCH]
+    
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                db_mb += os.path.getsize(p)
+            
+            wal_path = p + "-wal"
+            if os.path.exists(wal_path):
+                wal_mb += os.path.getsize(wal_path)
+        except OSError:
+            pass
+            
+    return (db_mb / (1024*1024), wal_mb / (1024*1024))
 
 
-def get_file_size_mb(path):
+def get_count(db_path, sql):
     try:
-        return os.path.getsize(path) / (1024 * 1024)
-    except OSError:
-        return 0.0
+        uri_path = db_path.replace("\\", "/")
+        conn = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=1)
+        c = conn.cursor()
+        c.execute(sql)
+        val = c.fetchone()[0]
+        conn.close()
+        return val
+    except:
+        return 0
 
 
 def monitor():
     print("Initialising Monitor...")
     
     speed_history = deque(maxlen=AVG_WINDOW_SIZE)
-    last_count = 0
+    last_crawled = 0
     last_time = time.time()
     
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM visited")
-        last_count = c.fetchone()[0]
-        conn.close()
-    except: pass
+    last_crawled = get_count(config.DB_CRAWL, "SELECT COUNT(*) FROM visited")
 
     while True:
         try:
-            conn = get_db()
-            c = conn.cursor()
+            crawled_count = get_count(config.DB_CRAWL, "SELECT COUNT(*) FROM visited")
             
-            c.execute("SELECT COUNT(*) FROM visited")
-            current_total = c.fetchone()[0]
+            pending_count = get_count(config.DB_CRAWL, "SELECT COUNT(*) FROM frontier WHERE status = 0")
+            inflight_count = get_count(config.DB_CRAWL, "SELECT COUNT(*) FROM frontier WHERE status = 1")
             
-            c.execute("SELECT COUNT(*) FROM frontier WHERE status = 1")
-            active_threads = c.fetchone()[0]
+            retry_count = get_count(config.DB_CRAWL, "SELECT COUNT(*) FROM frontier WHERE retry_count > 0")
             
-            c.execute("""
-                SELECT COUNT(*) FROM frontier 
-                WHERE status = 0 
-                OR (status = 2 AND next_crawl_time < datetime('now'))
-            """)
-            queue_size = c.fetchone()[0]
+            indexed_count = get_count(config.DB_SEARCH, "SELECT COUNT(*) FROM search_index")
             
-            c.execute("SELECT COUNT(*) FROM frontier WHERE retry_count > 0 AND status = 0")
-            retries = c.fetchone()[0]
-            
-            conn.close()
+            db_size, wal_size = get_sizes_mb()
 
             now = time.time()
             time_delta = now - last_time
-            count_delta = current_total - last_count
+            count_delta = crawled_count - last_crawled
             
             if time_delta > 0:
                 instant_ppm = (count_delta / time_delta) * 60
                 speed_history.append(instant_ppm)
             
-            last_count = current_total
+            last_crawled = crawled_count
             last_time = now
 
-            if speed_history:
-                avg_ppm = sum(speed_history) / len(speed_history)
-            else:
-                avg_ppm = 0
-                
-            daily_volume = avg_ppm * 60 * 24
-            db_size = get_file_size_mb(config.DB_PATH)
-            wal_size = get_file_size_mb(config.DB_PATH + "-wal")
+            avg_ppm = sum(speed_history) / len(speed_history) if speed_history else 0
+            daily_vol = avg_ppm * 60 * 24
 
             os.system('cls' if os.name == 'nt' else 'clear')
             
@@ -96,34 +86,33 @@ def monitor():
             print(f"  PERFORMANCE")
             print(f"  -----------")
             print(f"  Speed:          {int(avg_ppm)} PPM")
-            print(f"  Daily Vol:      {int(daily_volume):,} pages/day")
-            print(f"  Active Threads: {active_threads}")
+            print(f"  Daily Vol:      {int(daily_vol):,} pages/24H")
             print(f"")
             print(f"  STORAGE")
             print(f"  -------")
-            print(f"  Database:       {db_size:.1f} MB")
-            print(f"  WAL (Buffer):   {wal_size:.1f} MB")
+            print(f"  DB Size:        {db_size:.1f} MB")
+            print(f"  WAL Buffer:     {wal_size:.1f} MB  <-- (Writes Pending)")
             print(f"")
-            print(f"  FRONTIER STATUS")
+            print(f"  PIPELINE STATUS")
             print(f"  ---------------")
-            print(f"  Total Indexed:  {current_total:,}")
-            print(f"  Queue Size:     {queue_size:,}")
-            print(f"  Retries:        {retries:,}")
+            print(f"  1. Pending:     {pending_count:,}  (Waiting in DB)")
+            print(f"  2. In-Flight:   {inflight_count:,}  (Active Threads)")
+            print(f"  3. Crawled:     {crawled_count:,}  (Downloaded)")
+            print(f"  4. Indexed:     {indexed_count:,}  (Searchable)")
+            print(f"")
+            print(f"  Errors/Retries: {retry_count:,}")
             print(f"")
             print(f"=======================================================")
             print(f" Press Ctrl+C to exit monitor")
 
             time.sleep(REFRESH_RATE)
 
-        except sqlite3.OperationalError:
-            time.sleep(1)
         except KeyboardInterrupt:
             print("\nMonitor closed.")
             sys.exit()
         except Exception as e:
-            print(f"Monitor Error: {e}")
-            time.sleep(5)
-
+            print(f"Monitor glitch: {e}")
+            time.sleep(1)
 
 if __name__ == "__main__":
     monitor()

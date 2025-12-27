@@ -1,490 +1,447 @@
-import sqlite3, time, logging, requests, sys, os, threading, queue, random, json, zlib
+import sqlite3, time, logging, requests, sys, os, threading, queue, random, json, zlib, ssl, urllib3
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
 from requests.adapters import HTTPAdapter, Retry
-from langdetect import detect, LangDetectException
 from selectolax.parser import HTMLParser
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import config
-from crawler.utils import canonicalise, get_high_perf_connection, BloomFilter, compress_html
+from crawler.utils import canonicalise, compress_html, RotationalBloomFilter
 
 
-# --- CONFIG & LOGGING ---
+# --- LOGGING ---
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s", datefmt='%H:%M:%S')
+file_handler = logging.FileHandler(config.LOG_PATH, encoding='utf-8', mode='w') 
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+stream_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%H:%M:%S')
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO) 
+stream_handler.setFormatter(stream_formatter)
+root_logger.addHandler(stream_handler)
+
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt='%H:%M:%S',
-    handlers=[
-        logging.FileHandler(config.LOG_PATH, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# --- QUEUES ---
+FETCH_QUEUE = queue.Queue(maxsize=5000)
+PARSE_QUEUE = queue.Queue()
+WRITE_QUEUE = queue.Queue()
 
-
-ROBOTS_CACHE = {}
-DOMAIN_LAST_ACCESSED = {}
-DOMAIN_LOCK = threading.Lock()
-
-LINK_BUFFER = queue.Queue()
-VISITED_BUFFER = queue.Queue()
-DISPATCH_QUEUE = queue.Queue()
-DISPATCH_LOCK = threading.Lock()
-
-MAX_BUFFER_SIZE = 5000   
-VISITED_BATCH_SIZE = 200  
-
-BLOOM = BloomFilter(100_000_000, 7) 
+# --- BLOOM FILTER ---
+BLOOM = RotationalBloomFilter(100_000_000, 7, data_dir=config.DATA_DIR)
 BLOOM_LOCK = threading.Lock()
 
-thread_local = threading.local()
 
+# --- DOMAIN GOVERNANCE ---
+class DomainManager:
+    def __init__(self):
+        self.locks = defaultdict(threading.Lock)
+        self.last_access = defaultdict(float)
+        self.failures = defaultdict(int)
+        self.page_counts = defaultdict(int)
+
+    def can_crawl(self, domain):
+        if self.page_counts[domain] >= config.MAX_PAGES_PER_DOMAIN:
+            logging.debug(f"[Gov] SKIP {domain}: Hit Max Cap ({config.MAX_PAGES_PER_DOMAIN})")
+            return False
+        
+        if self.failures[domain] > 10:
+            if time.time() - self.last_access[domain] < 300: 
+                logging.debug(f"[Gov] SKIP {domain}: Penalty Box (Failures: {self.failures[domain]})")
+                return False
+        
+        if time.time() - self.last_access[domain] < config.CRAWL_DELAY:
+            logging.debug(f"[Gov] SKIP {domain}: Politeness Wait")
+            return False
+            
+        return True
+
+    def mark_access(self, domain): self.last_access[domain] = time.time()
+    def mark_success(self, domain): self.page_counts[domain] += 1
+    def mark_failure(self, domain):
+        self.failures[domain] += 1
+        self.last_access[domain] = time.time()
+
+DOMAIN_MGR = DomainManager()
+
+
+# --- LEGACY SSL ADAPTER ---
+class LegacySSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.options &= ~ssl.OP_NO_SSLv3
+        ctx.options |= 0x4
+        try:
+            ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+        except:
+            pass
+        
+        self.poolmanager = urllib3.poolmanager.PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            ssl_context=ctx,
+            **pool_kwargs
+        )
+
+
+# --- NETWORK ---
 SESSION = requests.Session()
 retries = Retry(total=0, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retries, pool_connections=200, pool_maxsize=200)
+adapter = LegacySSLAdapter(max_retries=retries, pool_connections=config.FETCH_THREADS, pool_maxsize=config.FETCH_THREADS)
 SESSION.mount("http://", adapter)
 SESSION.mount("https://", adapter)
 
 
-def get_db():
-    if not hasattr(thread_local, "conn"):
-        thread_local.conn = get_high_perf_connection(config.DB_PATH)
-    return thread_local.conn
+# --- ROBOTS CACHE ---
+class RobotParser(robotparser.RobotFileParser):
+    def __init__(self, url=''):
+        super().__init__(url)
 
 
-def calculate_priority(url):
-    score = 10
-    try:
-        parsed = urlparse(url)
-        score += url.count('/') * 2
-        if parsed.query: score += 20
-        trap_keywords = ['search', 'filter', 'login', 'signup', 'calendar', 'archive', 'tag']
-        if any(k in url.lower() for k in trap_keywords): score += 50
-        if len(parsed.path) <= 1 and not parsed.query: score = 1
-    except: pass
-    return score
+ROBOTS_CACHE = {}
+ROBOTS_LOCK = threading.Lock()
+ROBOTS_TTL = 86400
 
 
-def get_domain_rank(domain):
-    try:
-        if domain.startswith("www."): search_domain = domain[4:]
-        else: search_domain = domain
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT rank FROM domain_authority WHERE domain = ? LIMIT 1", (search_domain,))
-        row = c.fetchone()
-        return row[0] if row else 10_000_000
-    except:
-        return 10_000_000
-
-
-def calculate_next_crawl(rank):
-    if rank < 1000: return 1
-    if rank < 10000: return 3
-    if rank < 100000: return 7
-    return 30
-
-
-# --- PREFETCHING ---
-def get_next_url():
-    try:
-        return DISPATCH_QUEUE.get_nowait()
-    except queue.Empty:
-        pass
-
-    with DISPATCH_LOCK:
-        if not DISPATCH_QUEUE.empty():
-            return DISPATCH_QUEUE.get()
-
-        conn = get_db()
+def check_robots_allow(domain, url):    
+    now = time.time()
+    rp = None
+    with ROBOTS_LOCK:
+        if domain in ROBOTS_CACHE:
+            parser, ts = ROBOTS_CACHE[domain]
+            if now - ts < ROBOTS_TTL:
+                rp = parser
+    
+    if not rp:
+        logging.debug(f"[Robots] Fetching for {domain}")
+        rp = RobotParser()
+        rp.set_url(f"http://{domain}/robots.txt")
         try:
-            c = conn.cursor()
-            c.execute("BEGIN IMMEDIATE")
-            
-            c.execute("""
-                SELECT url, retry_count FROM frontier 
-                WHERE status = 0 
-                OR (status = 2 AND next_crawl_time < CURRENT_TIMESTAMP)
-                ORDER BY priority ASC, next_crawl_time ASC
-                LIMIT 200
-            """)
-            rows = c.fetchall()
-            
-            if rows:
-                batch_urls = [(r[0],) for r in rows]
-                c.executemany("UPDATE frontier SET status = 1 WHERE url = ?", batch_urls)
-                conn.commit()
-                
-                random.shuffle(rows)
-                for r in rows:
-                    DISPATCH_QUEUE.put((r[0], r[1]))
-                
-                logging.info(f" [SYSTEM] Refueled: Dispatched {len(rows)} URLs.")
-                return DISPATCH_QUEUE.get()
-            else:
-                conn.commit()
-                time.sleep(1)
-                return None, 0
-        
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e):
-                time.sleep(random.uniform(0.5, 1.5))
-            else:
-                try: conn.rollback()
-                except: pass
-            return None, 0
+            rp.read()
         except Exception as e:
-            logging.error(f"Dispatch Error: {e}")
-            return None, 0
-
-
-def crawl_url(current_url, retry_count):
+            logging.debug(f"[Robots] Failed {domain}: {e}")
+        
+        with ROBOTS_LOCK:
+            ROBOTS_CACHE[domain] = (rp, now)
+    
     try:
-        domain = urlparse(current_url).netloc
-        
-        with DOMAIN_LOCK:
-            last = DOMAIN_LAST_ACCESSED.get(domain, 0)
-            now = time.time()
-            if now - last < config.CRAWL_DELAY:
-                time.sleep(config.CRAWL_DELAY - (now - last))
-            DOMAIN_LAST_ACCESSED[domain] = time.time()
-        
-        logging.info(f"Crawling: {current_url}")
-        
-        result = download_page(current_url)
-        
-        if result['error']:
-            if retry_count < 3:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute("UPDATE frontier SET status = 0, priority = 100, retry_count = ? WHERE url = ?", (retry_count + 1, current_url))
-                conn.commit()
-            else:
-                mark_frontier_status(current_url, 3) 
-            return
-
-        raw_bytes = result['content']
-        http_headers = result['headers']
-        status_code = result['status']
-        
-        tree = HTMLParser(raw_bytes)
-        
-        compressed_html = compress_html(raw_bytes)
-        
-        for tag in tree.css('script, style, nav, footer, header, noscript, iframe, svg'):
-            tag.decompose()
-
-        title_node = tree.css_first('title')
-        title = title_node.text(strip=True) if title_node else "No Title"
-
-        desc_node = tree.css_first('meta[name="description"]')
-        description = desc_node.attributes.get('content', '') if desc_node else ""
-
-        h1 = " ".join([n.text(strip=True) for n in tree.css('h1')])
-        h2 = " ".join([n.text(strip=True) for n in tree.css('h2, h3')])
-        important_text = " ".join([n.text(strip=True) for n in tree.css('b, strong, em')])
-        
-        content = tree.body.text(separator=' ', strip=True) if tree.body else ""
-        
-        links = []
-        if DISPATCH_QUEUE.qsize() < 50000:
-            for node in tree.css('a[href]'):
-                href = node.attributes.get('href')
-                clean = canonicalise(urljoin(current_url, href))
-                if clean: links.append(clean)
-        
-        lang = "unknown"
-        try:
-            if len(content) > 100:
-                lang = detect(content[:500])
-        except LangDetectException: pass
-        
-        rank = get_domain_rank(domain)
-        
-        VISITED_BUFFER.put({
-            'url': current_url,
-            'title': title,
-            'description': description,
-            'content': content,
-            'raw_html': compressed_html,
-            'headers': json.dumps(dict(http_headers)),
-            'status': status_code,
-            'h1': h1,
-            'h2': h2,
-            'important_text': important_text,
-            'lang': lang,
-            'out_links': len(links),
-            'domain_rank': rank
-        })
-        
-        add_to_frontier_batch(links)
-            
-    except Exception as e:
-        mark_frontier_status(current_url, 3)
-
-
-def mark_frontier_status(url, status):
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE frontier SET status = ? WHERE url = ?", (status, url))
-        conn.commit()
-    except: pass
-
-
-def requeue_url(url, retry_count):
-    conn = get_db()
-    try:
-        c = conn.cursor()
-        c.execute("UPDATE frontier SET status = 0, retry_count = ? WHERE url = ?", (retry_count, url))
-        conn.commit()
-    except: pass
-
-
-def add_to_frontier_batch(urls):
-    if not urls: return
-    to_add = []
-    with BLOOM_LOCK:
-        for u in urls:
-            if not BLOOM.lookup(u):
-                BLOOM.add(u)
-                to_add.append(u)
-    for u in to_add:
-        LINK_BUFFER.put(u)
-
-
-def check_permission(target_url, agent=config.USER_AGENT):
-    try:
-        parsed = urlparse(target_url)
-        domain = parsed.netloc
-        cache_key = f"{parsed.scheme}://{domain}"
-        if cache_key in ROBOTS_CACHE:
-            return ROBOTS_CACHE[cache_key].can_fetch(agent, target_url)
-        rp = robotparser.RobotFileParser()
-        rp.set_url(f"{parsed.scheme}://{domain}/robots.txt")
-        rp.read()
-        ROBOTS_CACHE[cache_key] = rp
-        return rp.can_fetch(agent, target_url)
+        allowed = rp.can_fetch(config.USER_AGENT, url)
+        if not allowed:
+            logging.debug(f"[Robots] DENIED {url}")
+        return allowed
     except:
         return True
 
 
-def download_page(target_url):
-    result = {'content': None, 'headers': {}, 'status': 0, 'error': None}
-    try:
-        response = SESSION.get(target_url, headers={'User-Agent': config.USER_AGENT}, timeout=(3, 10), stream=True)
-        
-        result['status'] = response.status_code
-        result['headers'] = response.headers
-        
-        if response.status_code != 200: 
-            logging.warning(f" [!] Status {response.status_code}: {target_url}")
-            result['error'] = "HTTP_ERROR"
-            return result
-            
-        if "text/html" not in response.headers.get("Content-Type", "").lower(): 
-            result['error'] = "NOT_HTML"
-            return result
-        
-        content = response.raw.read(config.MAX_BYTES + 1, decode_content=True)
-        if len(content) > config.MAX_BYTES: 
-            result['error'] = "TOO_LARGE"
-            return result
-        
-        result['content'] = content
-        return result
-
-    except requests.exceptions.Timeout:
-        logging.warning(f" [!] Timeout: {target_url}")
-        result['error'] = "TIMEOUT"
-    except requests.exceptions.SSLError:
-        logging.warning(f" [!] SSL Error: {target_url}")
-        result['error'] = "SSL_ERROR"
-    except requests.exceptions.RequestException as e:
-        logging.warning(f" [!] Connection Error: {target_url} ({e})")
-        result['error'] = "NET_ERROR"
-    except Exception as e:
-        logging.error(f" [!] Unknown Error: {target_url} -> {e}")
-        result['error'] = "UNKNOWN"
-        
-    return result
-
-
-# --- DATABASE WRITER ---
-class DatabaseWriter(threading.Thread):
-    def __init__(self):
-        super().__init__()
-        self.daemon = True 
-        self.running = True
-
-    def stop(self):
-        self.running = False
-
-    def run(self):
-        logging.info(" [DB] Writer thread started. Hydrating Bloom...")
-        conn = get_high_perf_connection(config.DB_PATH)
-        
+# --- WORKER: FETCHER ---
+def fetch_worker():
+    while True:
         try:
-            c = conn.cursor()
-            c.execute("SELECT url FROM visited")
-            while True:
-                batch = c.fetchmany(50000)
-                if not batch: break
-                with BLOOM_LOCK:
-                    for row in batch: BLOOM.add(row[0])
+            url, retry_count = FETCH_QUEUE.get()
+            domain = urlparse(url).netloc
             
-            c.execute("SELECT url FROM frontier")
-            while True:
-                batch = c.fetchmany(50000)
-                if not batch: break
-                with BLOOM_LOCK:
-                    for row in batch: BLOOM.add(row[0])
-            logging.info(" [DB] Bloom Hydrated.")
-        except: pass
+            if not DOMAIN_MGR.can_crawl(domain):
+                if DOMAIN_MGR.page_counts[domain] >= config.MAX_PAGES_PER_DOMAIN:
+                    WRITE_QUEUE.put(('status_update', (2, url)))
+                else:
+                    FETCH_QUEUE.put((url, retry_count))
+                    time.sleep(0.1)
+                FETCH_QUEUE.task_done()
+                continue
 
-        last_checkpoint = time.time()
+            if not check_robots_allow(domain, url):
+                WRITE_QUEUE.put(('status_update', (3, url)))
+                FETCH_QUEUE.task_done()
+                continue
+            
+            with DOMAIN_MGR.locks[domain]:
+                DOMAIN_MGR.mark_access(domain)
+                start_t = time.time()
+                result = download_page(url)
+                dur = time.time() - start_t
 
-        while self.running:
+            if result['error']:
+                logging.debug(f"[Fetch] FAIL {url} ({result['error']}) {dur:.2f}s")
+                DOMAIN_MGR.mark_failure(domain)
+                if retry_count < 2:
+                    WRITE_QUEUE.put(('retry', (url, retry_count + 1)))
+                else:
+                    WRITE_QUEUE.put(('status_update', (3, url)))
+            else:
+                logging.debug(f"[Fetch] OK {url} {dur:.2f}s")
+                DOMAIN_MGR.mark_success(domain)
+                PARSE_QUEUE.put((url, result, retry_count))
+            
+            FETCH_QUEUE.task_done()
+        except Exception as e:
+            logging.error(f"Fetch Error: {e}", exc_info=True)
+            time.sleep(0.1)
+
+
+# --- WORKER: PROCESSOR ---
+def parse_worker():
+    while True:
+        try:
+            url, result, retry_count = PARSE_QUEUE.get()
+            start_t = time.time()
+            raw_bytes = result['content']
+            
             try:
-                if LINK_BUFFER.qsize() >= MAX_BUFFER_SIZE or (not LINK_BUFFER.empty() and time.time() % 5 < 0.1):
-                    self.flush_links(conn)
-                
-                if VISITED_BUFFER.qsize() >= VISITED_BATCH_SIZE or (not VISITED_BUFFER.empty() and time.time() % 5 < 0.1):
-                    self.flush_visited(conn)
-                
-                if time.time() - last_checkpoint > 60:
+                html_str = raw_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                html_str = raw_bytes.decode('latin-1', errors='ignore')
+            
+            tree = HTMLParser(html_str)
+            
+            for tag in tree.css('script, style, nav, footer, header, noscript, iframe, svg'):
+                tag.decompose()
+
+            title_node = tree.css_first('title')
+            title = title_node.text(strip=True) if title_node else ""
+            
+            desc = ""
+            meta = tree.css_first('meta[name="description"]')
+            if meta: desc = meta.attributes.get('content', '')
+            
+            content = ""
+            if tree.body:
+                content = tree.body.text(separator=' ', strip=True)
+                content = " ".join(content.split())
+                if len(content) > config.MAX_TEXT_CHARS:
+                    content = content[:config.MAX_TEXT_CHARS]
+            
+            links = []
+            if FETCH_QUEUE.qsize() < 5000:
+                for node in tree.css('a[href]'):
+                    href = node.attributes.get('href')
                     try:
-                        conn.execute("PRAGMA wal_checkpoint(PASSIVE);") 
-                        wal_path = config.DB_PATH + "-wal"
-                        if os.path.exists(wal_path):
-                            wal_size = os.path.getsize(wal_path)
-                            if wal_size > 500 * 1024 * 1024:
-                                logging.info(" [DB] WAL too large. Forcing TRUNCATE...")
-                                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                        last_checkpoint = time.time()
-                    except Exception as e:
-                        logging.error(f"Checkpoint Error: {e}")
+                        joined_url = urljoin(url, href)
+                        clean = canonicalise(joined_url)
+                        if clean: links.append(clean)
+                    except ValueError:
+                        continue
 
-                time.sleep(0.1) 
+            data_package = {
+                'url': url,
+                'title': title,
+                'description': desc,
+                'content': content,
+                'raw_html': compress_html(raw_bytes), 
+                'headers': json.dumps(dict(result['headers'])),
+                'status': result['status'],
+                'out_links': len(links),
+                'links_found': links
+            }
+            
+            logging.debug(f"[Parse] {url} -> {len(links)} links ({time.time()-start_t:.3f}s)")
+            
+            WRITE_QUEUE.put(('save_page', data_package))
+            PARSE_QUEUE.task_done()
+        except Exception as e:
+            logging.error(f"Parse Error: {e}", exc_info=True)
+            PARSE_QUEUE.task_done()
+
+
+# --- WORKER: DB WRITER ---
+def db_writer():
+    logging.info(" [DB] Writer started.")
+    conn_crawl = sqlite3.connect(config.DB_CRAWL, timeout=60)
+    conn_crawl.execute("PRAGMA journal_mode=WAL")
+    conn_crawl.execute("PRAGMA synchronous=OFF")
+    conn_storage = sqlite3.connect(config.DB_STORAGE, timeout=60)
+    conn_storage.execute("PRAGMA journal_mode=WAL")
+    conn_storage.execute("PRAGMA synchronous=OFF") 
+    
+    if hasattr(BLOOM, 'load'):
+        BLOOM.load()
+    last_bloom_save = time.time()
+
+    while True:
+        try:
+            batch_visited = []
+            batch_storage = []
+            batch_frontier = []
+            batch_status = []
+            batch_reserve = [] 
+            batch_retries = []
+
+            while not WRITE_QUEUE.empty() and len(batch_visited) < 2000:
+                msg_type, payload = WRITE_QUEUE.get()
+                
+                if msg_type == 'save_page':
+                    p = payload
+                    batch_visited.append((
+                        p['url'], p['title'], p['description'], p['status'], 
+                        None, p['out_links'], 
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        config.CRAWL_EPOCH, config.CRAWL_EPOCH
+                    ))
+                    batch_storage.append((
+                        p['url'], p['raw_html'], p['content'], p['title'], p['headers'], 
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+                    batch_status.append((2, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), p['url']))
+                    
+                    for link in p['links_found']:
+                        with BLOOM_LOCK:
+                            if not BLOOM.lookup(link):
+                                BLOOM.add(link)
+                                batch_frontier.append((link, urlparse(link).netloc))
+
+                elif msg_type == 'status_update':
+                    status, url = payload
+                    batch_status.append((status, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), url))
+                
+                elif msg_type == 'retry':
+                    url, retry = payload 
+                    batch_retries.append((retry, url))
+                    
+                elif msg_type == 'reserve':
+                    urls = payload
+                    batch_reserve.extend([(u,) for u in urls])
+
+                WRITE_QUEUE.task_done()
+
+            if any([batch_visited, batch_status, batch_frontier, batch_reserve, batch_retries]):
+                commit_start = time.time()
+                try:
+                    conn_crawl.execute("BEGIN IMMEDIATE")
+                    if batch_visited:
+                        conn_crawl.executemany("""
+                            INSERT OR REPLACE INTO visited 
+                            (url, title, description, http_status, language, out_links, crawled_at, crawl_epoch, last_seen_epoch)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, batch_visited)
+                    
+                    if batch_status:
+                        conn_crawl.executemany("UPDATE frontier SET status=?, next_crawl_time=? WHERE url=?", batch_status)
+                    
+                    if batch_frontier:
+                        conn_crawl.executemany("INSERT OR IGNORE INTO frontier (url, domain) VALUES (?, ?)", batch_frontier)
+                    
+                    if batch_reserve:
+                        conn_crawl.executemany("UPDATE frontier SET status=1, reserved_at=CURRENT_TIMESTAMP WHERE url=?", batch_reserve)
+
+                    if batch_retries:
+                        conn_crawl.executemany("UPDATE frontier SET status=0, priority=50, retry_count=? WHERE url=?", batch_retries)
+                        
+                    conn_crawl.commit()
+                except Exception as e:
+                    logging.error(f"Crawl DB Write Error: {e}", exc_info=True)
+                    try: conn_crawl.rollback()
+                    except: pass
+                
+                try:
+                    if batch_storage:
+                        conn_storage.execute("BEGIN IMMEDIATE")
+                        conn_storage.executemany("""
+                            INSERT OR REPLACE INTO html_storage (url, raw_html, parsed_text, title, http_headers, crawled_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, batch_storage)
+                        conn_storage.commit()
+                except Exception as e:
+                    logging.error(f"Storage DB Write Error: {e}", exc_info=True)
+                
+                logging.debug(f"[DB] Commit: {len(batch_visited)} visited, {len(batch_frontier)} new links ({time.time()-commit_start:.3f}s)")
+
+            if time.time() - last_bloom_save > 300:
+                if hasattr(BLOOM, 'save'): BLOOM.save()
+                last_bloom_save = time.time()
+            else:
+                time.sleep(0.05)
+
+        except Exception as e:
+            logging.error(f"DB Thread Error: {e}", exc_info=True)
+            time.sleep(1)
+
+
+# --- DISPATCHER ---
+def dispatcher_loop():
+    logging.info(" [SYS] Dispatcher started.")
+    conn = sqlite3.connect(config.DB_CRAWL, timeout=60)
+    dispatched_cache = deque(maxlen=20000) 
+    
+    while True:
+        if FETCH_QUEUE.qsize() < 2500:
+            try:
+                logging.debug("[Dispatch] Querying DB for jobs...")
+                start_t = time.time()
+                
+                cursor = conn.execute(f"""
+                    SELECT url, retry_count FROM frontier 
+                    WHERE status = 0 
+                    OR (status = 1 AND reserved_at < datetime('now', '-15 minutes'))
+                    ORDER BY priority ASC 
+                    LIMIT {config.BATCH_SIZE}
+                """)
+                rows = cursor.fetchall()
+                
+                valid_rows = [r for r in rows if r[0] not in dispatched_cache]
+                
+                if valid_rows:
+                    random.shuffle(valid_rows)
+                    
+                    urls = [r[0] for r in valid_rows]
+                    WRITE_QUEUE.put(('reserve', urls))
+                    dispatched_cache.extend(urls)
+                    
+                    for r in valid_rows:
+                        FETCH_QUEUE.put(r)
+                    
+                    logging.info(f" [SYS] Dispatched {len(valid_rows)} URLs ({time.time()-start_t:.3f}s).")
+                else:
+                    logging.debug("[Dispatch] Frontier empty. Sleeping.")
+                    time.sleep(2)
             except Exception as e:
-                logging.error(f"Writer Error: {e}")
-                time.sleep(1)
-
-        self.flush_links(conn)
-        self.flush_visited(conn)
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);") 
-        except: pass
-        conn.close()
-
-
-    def flush_links(self, conn):
-        links = []
-        while not LINK_BUFFER.empty() and len(links) < MAX_BUFFER_SIZE:
-            links.append(LINK_BUFFER.get())
-        if not links: return
-
-        data = []
-        for u in links:
-            data.append((u, urlparse(u).netloc, calculate_priority(u), 0))
-
-        try:
-            c = conn.cursor()
-            c.execute("BEGIN IMMEDIATE")
-            c.executemany("INSERT OR IGNORE INTO frontier (url, domain, priority, status) VALUES (?, ?, ?, ?)", data)
-            conn.commit()
-        except sqlite3.OperationalError: 
-            pass
-
-
-    def flush_visited(self, conn):
-        batch = []
-        urls_crawled = []
-        
-        while not VISITED_BUFFER.empty() and len(batch) < VISITED_BATCH_SIZE:
-            item = VISITED_BUFFER.get()
-            
-            rank = item['domain_rank']
-            days_to_wait = calculate_next_crawl(rank)
-            next_crawl = (datetime.now() + timedelta(days=days_to_wait)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            batch.append((
-                item['url'], 
-                item['title'], 
-                item['description'], 
-                "", 
-                item['content'],
-                item['raw_html'],
-                item['headers'],
-                item['status'],
-                item['h1'], 
-                item['h2'], 
-                item['important_text'],
-                item['lang'], 
-                item['out_links'], 
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
-                item['domain_rank']
-            ))
-            
-            urls_crawled.append((2, next_crawl, item['url']))
-
-        if not batch: return
-
-        try:
-            c = conn.cursor()
-            c.execute("BEGIN IMMEDIATE")
-            
-            c.executemany("""
-                INSERT OR REPLACE INTO visited 
-                (url, title, description, keywords, content, raw_html, http_headers, http_status, 
-                h1, h2, important_text, language, out_links, crawled_at, domain_rank) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, batch)
-            
-            c.executemany("UPDATE frontier SET status = ?, next_crawl_time = ? WHERE url = ?", urls_crawled)
-            
-            conn.commit()
-            logging.info(f" [DB] Saved {len(batch)} pages.")
-        except sqlite3.OperationalError:
-            pass
-
-
-def release_url(url):
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE frontier SET status = 0 WHERE url = ?", (url,))
-        conn.commit()
-    except: pass
-
-
-def recover_on_startup():
-    logging.info(" [SYSTEM] Running self-checks...")
-    try:
-        conn = get_high_perf_connection(config.DB_PATH)
-        c = conn.cursor()
-        
-        c.execute("SELECT COUNT(*) FROM frontier WHERE status = 1")
-        stuck = c.fetchone()[0]
-        
-        if stuck > 0:
-            logging.info(f" [SYSTEM] Found {stuck} stuck jobs from previous run. Recovering...")
-            c.execute("UPDATE frontier SET status = 0 WHERE status = 1")
-            conn.commit()
-            logging.info(" [SYSTEM] Recovery complete. All URLs reset to pending.")
+                logging.error(f"Dispatch Error: {e}", exc_info=True)
+                time.sleep(5)
         else:
-            logging.info(" [SYSTEM] Database is clean.")
-            
-        conn.close()
+            time.sleep(0.5)
+
+
+def download_page(url):
+    res = {'content': None, 'headers': {}, 'status': 0, 'error': None}
+    try:
+        r = SESSION.get(url, headers={'User-Agent': config.USER_AGENT}, timeout=(3, 10))
+        res['status'] = r.status_code
+        res['headers'] = r.headers
+        
+        if r.status_code != 200:
+            res['error'] = f"HTTP_{r.status_code}"
+            return res
+        
+        if "text/html" not in r.headers.get("Content-Type", "").lower():
+            res['error'] = "NOT_HTML"
+            return res
+        
+        if len(r.content) > config.MAX_BYTES:
+            res['error'] = "TOO_LARGE"
+            return res
+        
+        res['content'] = r.content
+        return res
     except Exception as e:
-        logging.error(f" [SYSTEM] Recovery failed: {e}")
+        res['error'] = f"NET_ERROR: {str(e)[:50]}"
+    return res
 
 
-def start_writer():
-    writer = DatabaseWriter()
-    writer.start()
-    return writer
+def recover():
+    try:
+        conn = sqlite3.connect(config.DB_CRAWL)
+        conn.execute("UPDATE frontier SET status=0 WHERE status=1")
+        conn.commit()
+        conn.close()
+    except: pass
