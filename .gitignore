@@ -1,11 +1,37 @@
-# Python
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+
+# --- Virtual Environments ---
+venv/
+env/
+.venv/
+
+# --- Environment Variables (Secrets) ---
 .env
 
-# OS
+# --- Operating System Files ---
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Venv
-venv/
+# --- VS Code Settings ---
+.vscode/
+
+# --- Cybersecurity & Networking ---
+*.pcap
+*.pcapng
+*.cap
+
+# Scan Outputs & Reports
+*.log
+*.csv
+*.json
+*.xml
+*.txt
+
+# Visualization / Graphs
+*.png
+*.svg
+*.dot
