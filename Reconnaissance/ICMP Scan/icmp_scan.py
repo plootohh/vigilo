@@ -131,7 +131,7 @@ def batch_hosts(network: ipaddress.IPv4Network, batch_size: int = 1000) -> Gener
 # Main Logic
 # ------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Professional ICMP Scanner (Portable Mode)")
+    parser = argparse.ArgumentParser(description="Vigilo ICMP Scanner")
     parser.add_argument("network", nargs="?", help="CIDR to scan (e.g., 192.168.1.0/24)")
     parser.add_argument("-c", "--count", type=int, default=1, help="Packets per host (Default: 1)")
     parser.add_argument("-t", "--timeout", type=float, default=1.0, help="Timeout in seconds (Default: 1.0)")
@@ -141,7 +141,7 @@ def main():
     args = parser.parse_args()
     
     local_ip = get_local_ip()
-    print(f"--- Python ICMP Scanner (Local IP: {local_ip}) ---")
+    print(f"--- Vigilo ICMP Scanner (Local IP: {local_ip}) ---")
 
     target_cidr = args.network
     network = None
