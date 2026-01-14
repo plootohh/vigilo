@@ -15,8 +15,6 @@ ALL_PORTS = list(range(1, 65536))
 
 PORT_PROFILES = {
     "all": ALL_PORTS,
-    "*": ALL_PORTS,
-    "-": ALL_PORTS,
     "common": [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8080],
     "web": [80, 443, 8080, 8443, 8000, 8008, 8888],
     "db": [1433, 1521, 3306, 5432, 6379, 27017],
@@ -196,7 +194,7 @@ def scan_syn(ip: str, port: int, timeout: float, retries: int) -> Tuple[int, boo
 # Main Execution
 # ------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Professional TCP Scanner")
+    parser = argparse.ArgumentParser(description="Vigilo TCP Scanner")
     parser.add_argument("target", nargs="?", help="Target IP or Hostname")
     parser.add_argument("-p", "--ports", help="Ports, Profile, or 'all'")
     parser.add_argument("-t", "--timeout", type=float, default=1.5, help="Timeout in seconds")
@@ -207,7 +205,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("--- Python TCP Scanner v3.1 ---")
+    print("--- Vigilo TCP Scanner ---")
 
     # 1. Setup
     target_input = args.target
