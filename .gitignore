@@ -8,8 +8,10 @@ venv/
 env/
 .venv/
 
-# --- Environment Variables (Secrets) ---
+# --- Environment Variables & Secrets ---
 .env
+.env.*
+!.env.example
 
 # --- Operating System Files ---
 .DS_Store
@@ -31,7 +33,7 @@ Desktop.ini
 *.xml
 *.txt
 
-# Visualization / Graphs
+# Visualisation & Graphs
 *.png
 *.svg
 *.dot
