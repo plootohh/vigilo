@@ -18,7 +18,7 @@ Here is the list of tools I am working on (subject to change):
 - [x] ICMP Scanner
 - [x] TCP Port Scanner
 - [x] Traceroute Wrapper
-- [ ] Banner Grabber
+- [x] Banner Grabber (IN PROGRESS)
 - [ ] WHOIS Lookup
 - [ ] DNS Enumerator
 
